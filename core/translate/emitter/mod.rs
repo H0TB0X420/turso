@@ -18,7 +18,9 @@ use super::order_by::SortMetadata;
 use super::plan::{HashJoinType, TableReferences};
 use crate::error::SQLITE_CONSTRAINT_CHECK;
 use crate::function::Func;
-use crate::schema::{BTreeTable, CheckConstraint, Column, IndexColumn, Schema, Table};
+use crate::schema::{
+    BTreeTable, CheckConstraint, Column, GeneratedType, IndexColumn, Schema, Table,
+};
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
     bind_and_rewrite_expr, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
@@ -1469,32 +1471,33 @@ fn emit_index_column_value_new_image(
         let col_in_table = columns
             .get(idx_col.pos_in_table)
             .expect("column index out of bounds");
-        if col_in_table.is_virtual_generated() {
-            let column_lookup = crate::schema::build_column_name_lookup(columns);
-            update::emit_generated_expr_from_registers(
-                program,
-                col_in_table
-                    .generated_expr()
-                    .expect("virtual generated column must have expression"),
-                dest_reg,
-                columns_start_reg,
-                &column_lookup,
-                columns,
-                resolver,
-                Some(rowid_reg),
-            )?;
-            program.emit_column_affinity(dest_reg, col_in_table.affinity());
-        } else {
-            let src_reg = if col_in_table.is_rowid_alias() {
-                rowid_reg
-            } else {
-                columns_start_reg + idx_col.pos_in_table
-            };
-            program.emit_insn(Insn::Copy {
-                src_reg,
-                dst_reg: dest_reg,
-                extra_amount: 0,
-            });
+        match col_in_table.generated_type() {
+            GeneratedType::Virtual(ref expr) => {
+                let column_lookup = crate::schema::build_column_name_lookup(columns);
+                update::emit_generated_expr_from_registers(
+                    program,
+                    expr,
+                    dest_reg,
+                    columns_start_reg,
+                    &column_lookup,
+                    columns,
+                    resolver,
+                    Some(rowid_reg),
+                )?;
+                program.emit_column_affinity(dest_reg, col_in_table.affinity());
+            }
+            GeneratedType::NotGenerated => {
+                let src_reg = if col_in_table.is_rowid_alias() {
+                    rowid_reg
+                } else {
+                    columns_start_reg + idx_col.pos_in_table
+                };
+                program.emit_insn(Insn::Copy {
+                    src_reg,
+                    dst_reg: dest_reg,
+                    extra_amount: 0,
+                });
+            }
         }
     }
     Ok(())

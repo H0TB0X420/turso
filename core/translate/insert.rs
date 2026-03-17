@@ -1,3 +1,4 @@
+use crate::schema::GeneratedType;
 use crate::turso_debug_assert;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
@@ -2643,19 +2644,16 @@ pub fn compute_virtual_columns_for_triggers<'a>(
     resolver: &Resolver,
 ) -> Result<()> {
     for col_mapping in col_mappings {
-        if col_mapping.column.is_virtual_generated() {
-            if let Some(gen_expr) = col_mapping.column.generated_expr() {
-                translate_generated_expr(
-                    program,
-                    gen_expr,
-                    col_mapping.register,
-                    col_mappings,
-                    rowid_alias,
-                    resolver,
-                )?;
-                // Apply affinity for consistency
-                program.emit_column_affinity(col_mapping.register, col_mapping.column.affinity());
-            }
+        if let GeneratedType::Virtual(expr) = col_mapping.column.generated_type() {
+            translate_generated_expr(
+                program,
+                expr,
+                col_mapping.register,
+                col_mappings,
+                rowid_alias,
+                resolver,
+            )?;
+            program.emit_column_affinity(col_mapping.register, col_mapping.column.affinity());
         }
     }
     Ok(())
@@ -2665,7 +2663,7 @@ pub fn compute_virtual_columns_for_triggers<'a>(
 /// Handles Expr::Id column references by looking up their registers in col_mappings.
 fn translate_generated_expr<'a>(
     program: &mut ProgramBuilder,
-    expr: &ast::Expr,
+    expr: &Box<Expr>,
     target_register: usize,
     col_mappings: &[ColMapping<'a>],
     rowid_alias: Option<&ColMapping<'a>>,
@@ -2678,7 +2676,7 @@ fn translate_generated_expr<'a>(
         col_mappings,
         rowid_alias,
     };
-    translate_expr_with_context(program, &context, Box::new(expr.clone()), target_register, resolver)?;
+    translate_expr_with_context(program, &context, expr, target_register, resolver)?;
     Ok(())
 }
 
@@ -3366,7 +3364,7 @@ fn emit_index_column_value_for_insert(
             col_mappings: &insertion.col_mappings,
             rowid_alias,
         };
-        translate_expr_with_context(program, &context, expr.clone(), dest_reg, resolver)?;
+        translate_expr_with_context(program, &context, &expr, dest_reg, resolver)?;
         // Apply column affinity for VIRTUAL columns. This ensures INTEGER->REAL
         // conversions (and other affinity rules) happen per SQLite's documentation.
         if let Some(affinity) = &idx_col.affinity {

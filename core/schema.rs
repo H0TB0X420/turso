@@ -3703,14 +3703,6 @@ impl Column {
     }
 
     #[inline]
-    pub fn generated_expr_box(&self) -> Option<Box<Expr>> {
-        match &self.generated_type {
-            GeneratedType::Virtual(expr) => Some(expr.clone()),
-            GeneratedType::NotGenerated => None,
-        }
-    }
-
-    #[inline]
     pub fn generated_expr_cloned(&self) -> Option<Expr> {
         self.generated_expr().cloned()
     }

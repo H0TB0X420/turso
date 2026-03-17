@@ -1,4 +1,5 @@
 use super::TranslateCtx;
+use crate::schema::GeneratedType;
 use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::stmt_journal::any_effective_replace;
 use crate::{
@@ -1325,20 +1326,18 @@ fn emit_update_insns<'a>(
         let column_lookup = crate::schema::build_column_name_lookup(columns);
         let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
         for (idx, col) in columns.iter().enumerate() {
-            if col.is_virtual_generated() {
-                if let Some(gen_expr) = col.generated_expr() {
-                    emit_generated_expr_from_registers(
-                        program,
-                        gen_expr,
-                        start + idx,
-                        start,
-                        &column_lookup,
-                        columns,
-                        &t_ctx.resolver,
-                        Some(rowid_reg),
-                    )?;
-                    program.emit_column_affinity(start + idx, col.affinity());
-                }
+            if let GeneratedType::Virtual(expr) = col.generated_type() {
+                emit_generated_expr_from_registers(
+                    program,
+                    expr,
+                    start + idx,
+                    start,
+                    &column_lookup,
+                    columns,
+                    &t_ctx.resolver,
+                    Some(rowid_reg),
+                )?;
+                program.emit_column_affinity(start + idx, col.affinity());
             }
         }
     }
@@ -2482,7 +2481,7 @@ fn emit_update_insns<'a>(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_generated_expr_from_registers(
     program: &mut ProgramBuilder,
-    expr: &turso_parser::ast::Expr,
+    expr: &Box<ast::Expr>,
     target_reg: usize,
     registers_start: usize,
     column_lookup: &HashMap<String, usize>,
@@ -2499,7 +2498,7 @@ pub(super) fn emit_generated_expr_from_registers(
         columns,
         rowid_reg,
     };
-    translate_expr_with_context(program, &context, Box::new(expr.clone()), target_reg, resolver)?;
+    translate_expr_with_context(program, &context, expr, target_reg, resolver)?;
     Ok(())
 }
 
@@ -2527,42 +2526,34 @@ pub(super) fn compute_virtual_columns_for_update(
     use crate::translate::expr::{translate_expr_with_context, ExprContext, OldColumnSource};
 
     for (idx, column) in columns.iter().enumerate() {
-        if column.is_virtual_generated() {
-            if let Some(gen_expr) = column.generated_expr() {
-                match registers {
-                    VirtualColumnRegisters::Contiguous {
-                        registers_start,
-                        rowid_reg,
-                    } => {
-                        let target_reg = registers_start + idx;
-                        emit_generated_expr_from_registers(
-                            program,
-                            gen_expr,
-                            target_reg,
-                            *registers_start,
-                            column_lookup,
-                            columns,
-                            resolver,
-                            *rowid_reg,
-                        )?;
-                        program.emit_column_affinity(target_reg, column.affinity());
-                    }
-                    VirtualColumnRegisters::Indexed(old_registers) => {
-                        let target_reg = old_registers[idx];
-                        let context = ExprContext::OldGenerated {
-                            source: OldColumnSource::Registers(old_registers),
-                            column_lookup,
-                            columns,
-                        };
-                        translate_expr_with_context(
-                            program,
-                            &context,
-                            Box::new(gen_expr.clone()),
-                            target_reg,
-                            resolver,
-                        )?;
-                        program.emit_column_affinity(target_reg, column.affinity());
-                    }
+        if let GeneratedType::Virtual(expr) = column.generated_type() {
+            match registers {
+                VirtualColumnRegisters::Contiguous {
+                    registers_start,
+                    rowid_reg,
+                } => {
+                    let target_reg = registers_start + idx;
+                    emit_generated_expr_from_registers(
+                        program,
+                        expr,
+                        target_reg,
+                        *registers_start,
+                        column_lookup,
+                        columns,
+                        resolver,
+                        *rowid_reg,
+                    )?;
+                    program.emit_column_affinity(target_reg, column.affinity());
+                }
+                VirtualColumnRegisters::Indexed(old_registers) => {
+                    let target_reg = old_registers[idx];
+                    let context = ExprContext::OldGenerated {
+                        source: OldColumnSource::Registers(old_registers),
+                        column_lookup,
+                        columns,
+                    };
+                    translate_expr_with_context(program, &context, expr, target_reg, resolver)?;
+                    program.emit_column_affinity(target_reg, column.affinity());
                 }
             }
         }

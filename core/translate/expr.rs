@@ -16,7 +16,7 @@ use crate::function::FtsFunc;
 use crate::function::JsonFunc;
 use crate::function::{AggFunc, Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;
-use crate::schema::{ColDef, Column, Table, Type, TypeDef};
+use crate::schema::{ColDef, Column, GeneratedType, Table, Type, TypeDef};
 use crate::sync::Arc;
 use crate::translate::expression_index::{
     normalize_expr_for_index_matching, single_table_column_usage,
@@ -256,7 +256,7 @@ impl<'a> ExprContext<'a> {
     pub(crate) fn emit_virtual_column(
         &self,
         program: &mut ProgramBuilder,
-        expr: Box<Expr>,
+        expr: &Box<Expr>,
         affinity: &Affinity,
         target_reg: usize,
         resolver: &Resolver,
@@ -318,23 +318,20 @@ impl<'a> ExprContext<'a> {
                     });
 
                 if let Some(mapping) = mapping {
-                    if mapping.column.is_virtual_generated() {
-                        let Some(expr) = mapping.column.generated_expr_box() else {
-                            crate::bail_parse_error!(
-                                "virtual generated column is missing expression"
-                            );
-                        };
-                        let affinity = mapping.column.affinity();
-                        self.emit_virtual_column(program, expr, &affinity, target_reg, resolver)?;
-                    }
-                    if mapping.column.is_virtual_generated() {
-                    } else {
-                        // Regular column - copy from the pre-loaded register
-                        program.emit_insn(Insn::Copy {
-                            src_reg: mapping.register,
-                            dst_reg: target_reg,
-                            extra_amount: 0,
-                        });
+                    match mapping.column.generated_type() {
+                        GeneratedType::Virtual(expr) => {
+                            let affinity = mapping.column.affinity();
+                            self.emit_virtual_column(
+                                program, expr, &affinity, target_reg, resolver,
+                            )?;
+                        }
+                        GeneratedType::NotGenerated => {
+                            program.emit_insn(Insn::Copy {
+                                src_reg: mapping.register,
+                                dst_reg: target_reg,
+                                extra_amount: 0,
+                            });
+                        }
                     }
                     Ok(())
                 } else {
@@ -451,22 +448,12 @@ impl<'a> ExprContext<'a> {
         resolver: &Resolver,
         emit_non_virtual: impl FnOnce(&mut ProgramBuilder, usize, &Column) -> Result<()>,
     ) -> Result<()> {
-        if let Some(&col_idx) = column_lookup.get(&col_name.to_lowercase()) { //TODO is this the only place where the lookup is used? NO, there's 3 places, but they all have access to the columns anyways, so I should just build a struct that caches the lookup.
+        if let Some(&col_idx) = column_lookup.get(&col_name.to_lowercase()) {
             if let Some(col) = columns.get(col_idx) {
-                if col.is_virtual_generated() {
-                    let Some(expr) = col.generated_expr_box() else {
-                        crate::bail_parse_error!(
-                            "virtual generated column is missing expression"
-                        );
-                    };
+                if let GeneratedType::Virtual(expr) = col.generated_type() {
                     let affinity = col.affinity();
-                    return self.emit_virtual_column(
-                        program,
-                        expr,
-                        &affinity,
-                        target_reg,
-                        resolver,
-                    );
+                    return self
+                        .emit_virtual_column(program, expr, &affinity, target_reg, resolver);
                 }
             }
             let col = &columns[col_idx];
@@ -611,27 +598,27 @@ impl<'a> ExprContext<'a> {
 pub fn translate_expr_with_context(
     program: &mut ProgramBuilder,
     context: &ExprContext<'_>,
-    expr: Box<Expr>,
+    expr: &Box<Expr>,
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
     match context {
         ExprContext::Query { referenced_tables } => {
             // Delegate to the existing translate_expr for now
-            translate_expr(program, *referenced_tables, &expr, target_register, resolver)
+            translate_expr(program, *referenced_tables, expr, target_register, resolver)
         }
         ExprContext::VirtualColumn { .. } => {
             // Use the unified implementation for virtual column expressions
             // Column references (Expr::Id) are resolved via context.resolve_column_by_name(),
             // which creates Expr::Column and delegates back to translate_expr for cursor access.
-            translate_generated_expr_unified(program, context, &expr, target_register, resolver)?;
+            translate_generated_expr_unified(program, context, expr, target_register, resolver)?;
             Ok(target_register)
         }
         // For generated column contexts, use the unified implementation
         ExprContext::InsertGenerated { .. }
         | ExprContext::UpdateGenerated { .. }
         | ExprContext::OldGenerated { .. } => {
-            translate_generated_expr_unified(program, context, &expr, target_register, resolver)?;
+            translate_generated_expr_unified(program, context, expr, target_register, resolver)?;
             Ok(target_register)
         }
     }
@@ -4570,82 +4557,80 @@ pub fn translate_expr(
                             crate::bail_parse_error!("column index out of bounds");
                         };
 
-                        if table_column.is_virtual_generated() && !read_from_index {
-                            // VIRTUAL generated columns are computed from other columns, not stored.
-                            // We need to evaluate the generated expression.
-                            // However, if we're reading from an index that contains this VIRTUAL column,
-                            // the index already has the pre-computed value - we can read it directly.
-                            // is_virtual_generated() guarantees that the generated expression exists.
-                            let gen_expr = table_column.generated_expr().expect(
-                                "is_virtual_generated() guarantees generated expression exists",
-                            );
-                            // For virtual columns, we translate the generated expression.
-                            // Column references in the expression need to be translated recursively.
-                            let context = ExprContext::VirtualColumn {
-                                table,
-                                table_ref_id: *table_ref_id,
-                                referenced_tables,
-                            };
-                            translate_expr_with_context(
-                                program,
-                                &context,
-                                Box::new(gen_expr.clone()),
-                                target_register,
-                                resolver,
-                            )?;
-                            // Apply the VIRTUAL column's declared affinity to the
-                            // computed result. The expression may produce a different
-                            // type (e.g. REAL when the column is INTEGER).
-                            program.emit_insn(Insn::Affinity {
-                                start_reg: target_register,
-                                count: std::num::NonZeroUsize::MIN,
-                                affinities: table_column.affinity().aff_mask().to_string(),
-                            });
-                        } else {
-                            // Either:
-                            // 1. Regular column (not virtual generated), or
-                            // 2. VIRTUAL column but read_from_index is true (index has pre-computed value)
-                            let read_cursor = if read_from_index {
-                                index_cursor_id.expect("index cursor should be opened")
-                            } else {
-                                table_cursor_id
-                                    .or(index_cursor_id)
-                                    .expect("cursor should be opened")
-                            };
-                            let column = if read_from_index {
-                                let index = program.resolve_index_for_cursor_id(
-                                    index_cursor_id.expect("index cursor should be opened"),
-                                );
-                                index
-                                    .column_table_pos_to_index_pos(*column)
-                                    .unwrap_or_else(|| {
-                                        panic!(
-                                            "index {} does not contain column number {} of table {}",
-                                            index.name, column, table_ref_id
-                                        )
-                                    })
-                            } else {
-                                *column
-                            };
+                        match table_column.generated_type() {
+                            GeneratedType::Virtual(expr) if !read_from_index => {
+                                // VIRTUAL generated columns are computed from other columns, not stored.
+                                // We need to evaluate the generated expression.
+                                // However, if we're reading from an index that contains this VIRTUAL column,
+                                // the index already has the pre-computed value - we can read it directly.
 
-                            // For custom type columns with a default, suppress the
-                            // default in the Column instruction so we can encode it
-                            // ourselves. Without this, pre-existing rows (from before
-                            // ALTER TABLE ADD COLUMN) would get the raw un-encoded
-                            // default, causing decode to fail.
-                            let col_ref = table.get_column_at(column);
-                            if let Some(col) = col_ref {
-                                if col.default.is_some()
-                                    && resolver
-                                        .schema()
-                                        .get_type_def(&col.ty_str, table.is_strict())
-                                        .is_some()
-                                {
-                                    program.suppress_column_default = true;
-                                }
+                                // For virtual columns, we translate the generated expression.
+                                // Column references in the expression need to be translated recursively.
+                                let context = ExprContext::VirtualColumn {
+                                    table,
+                                    table_ref_id: *table_ref_id,
+                                    referenced_tables,
+                                };
+                                translate_expr_with_context(
+                                    program,
+                                    &context,
+                                    expr,
+                                    target_register,
+                                    resolver,
+                                )?;
+                                // Apply the VIRTUAL column's declared affinity to the
+                                // computed result. The expression may produce a different
+                                // type (e.g. REAL when the column is INTEGER).
+                                program.emit_insn(Insn::Affinity {
+                                    start_reg: target_register,
+                                    count: std::num::NonZeroUsize::MIN,
+                                    affinities: table_column.affinity().aff_mask().to_string(),
+                                });
                             }
-                            program.emit_column_or_rowid(read_cursor, column, target_register);
+                            _ => {
+                                let read_cursor = if read_from_index {
+                                    index_cursor_id.expect("index cursor should be opened")
+                                } else {
+                                    table_cursor_id
+                                        .or(index_cursor_id)
+                                        .expect("cursor should be opened")
+                                };
+                                let column = if read_from_index {
+                                    let index = program.resolve_index_for_cursor_id(
+                                        index_cursor_id.expect("index cursor should be opened"),
+                                    );
+                                    index
+                                        .column_table_pos_to_index_pos(*column)
+                                        .unwrap_or_else(|| {
+                                            panic!(
+                                                "index {} does not contain column number {} of table {}",
+                                                index.name, column, table_ref_id
+                                            )
+                                        })
+                                } else {
+                                    *column
+                                };
+
+                                // For custom type columns with a default, suppress the
+                                // default in the Column instruction so we can encode it
+                                // ourselves. Without this, pre-existing rows (from before
+                                // ALTER TABLE ADD COLUMN) would get the raw un-encoded
+                                // default, causing decode to fail.
+                                let col_ref = table.get_column_at(column);
+                                if let Some(col) = col_ref {
+                                    if col.default.is_some()
+                                        && resolver
+                                            .schema()
+                                            .get_type_def(&col.ty_str, table.is_strict())
+                                            .is_some()
+                                    {
+                                        program.suppress_column_default = true;
+                                    }
+                                }
+                                program.emit_column_or_rowid(read_cursor, column, target_register);
+                            }
                         }
+
                         let Some(column) = table.get_column_at(*column) else {
                             crate::bail_parse_error!("column index out of bounds");
                         };

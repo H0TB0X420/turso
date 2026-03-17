@@ -5,7 +5,7 @@ use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{Deterministic, Func, ScalarFunc};
 use crate::index_method::IndexMethodConfiguration;
 use crate::numeric::Numeric;
-use crate::schema::{Column, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
+use crate::schema::{Column, GeneratedType, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
@@ -569,10 +569,11 @@ pub fn resolve_sorted_columns(
             // during INSERT (since VIRTUAL columns are not stored in the table record).
             // Also store the column's affinity so it can be applied during index population
             // (INTEGER→REAL conversions, etc., per SQLite's affinity rules).
-            let (expr, affinity) = if column.is_virtual_generated() {
-                (column.generated_expr_box(), Some(column.affinity()))
-            } else {
-                (None, None)
+            let (expr, affinity) = match column.generated_type() {
+                GeneratedType::Virtual(expr) => {
+                    (Some(expr.clone()), Some(column.affinity()))
+                }
+                GeneratedType::NotGenerated => (None, None),
             };
             resolved.push(IndexColumn {
                 name: column_name,
@@ -773,15 +774,15 @@ fn is_deterministic_datetime_index_call(func: &Func, args: &[Box<Expr>]) -> bool
             !args.is_empty()
                 && !is_current_time_expr(args[0].as_ref())
                 && !args[1..]
-                    .iter()
-                    .any(|arg| is_unsafe_datetime_modifier(arg.as_ref()))
+                .iter()
+                .any(|arg| is_unsafe_datetime_modifier(arg.as_ref()))
         }
         Func::Scalar(ScalarFunc::StrfTime) => {
             args.len() >= 2
                 && !is_current_time_expr(args[1].as_ref())
                 && !args[2..]
-                    .iter()
-                    .any(|arg| is_unsafe_datetime_modifier(arg.as_ref()))
+                .iter()
+                .any(|arg| is_unsafe_datetime_modifier(arg.as_ref()))
         }
         Func::Scalar(ScalarFunc::TimeDiff) => {
             !args.iter().any(|arg| is_current_time_expr(arg.as_ref()))

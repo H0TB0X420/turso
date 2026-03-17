@@ -1,3 +1,4 @@
+use crate::schema::GeneratedType;
 use crate::translate::emitter::HashLabels;
 
 use super::*;
@@ -416,31 +417,29 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
             let payload_reg = planner.program.alloc_registers(num_payload);
             for (i, &col_idx) in config.payload_signature_columns.iter().enumerate() {
                 if let Some(column) = build_table.columns().get(col_idx) {
-                    if column.is_virtual_generated() {
-                        let context = ExprContext::VirtualColumn {
-                            table: &build_table.table,
-                            table_ref_id: build_table.internal_id,
-                            referenced_tables: Some(planner.table_references),
-                        };
-                        let Some(expr) = column.generated_expr_box() else {
-                            crate::bail_parse_error!(
-                                "virtual generated column is missing expression"
+                    match column.generated_type() {
+                        GeneratedType::Virtual(expr) => {
+                            let context = ExprContext::VirtualColumn {
+                                table: &build_table.table,
+                                table_ref_id: build_table.internal_id,
+                                referenced_tables: Some(planner.table_references),
+                            };
+                            let affinity = column.affinity();
+                            context.emit_virtual_column(
+                                planner.program,
+                                expr,
+                                &affinity,
+                                payload_reg + i,
+                                &planner.t_ctx.resolver,
+                            )?;
+                        }
+                        GeneratedType::NotGenerated => {
+                            planner.program.emit_column_or_rowid(
+                                payload_source_cursor_id,
+                                col_idx,
+                                payload_reg + i,
                             );
-                        };
-                        let affinity = column.affinity();
-                        context.emit_virtual_column(
-                            planner.program,
-                            expr,
-                            &affinity,
-                            payload_reg + i,
-                            &planner.t_ctx.resolver,
-                        )?;
-                    } else {
-                        planner.program.emit_column_or_rowid(
-                            payload_source_cursor_id,
-                            col_idx,
-                            payload_reg + i,
-                        );
+                        }
                     }
                 } else {
                     planner.program.emit_column_or_rowid(
