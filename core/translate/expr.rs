@@ -4582,6 +4582,14 @@ pub fn translate_expr(
                                 target_register,
                                 resolver,
                             )?;
+                            // Apply the VIRTUAL column's declared affinity to the
+                            // computed result. The expression may produce a different
+                            // type (e.g. REAL when the column is INTEGER).
+                            program.emit_insn(Insn::Affinity {
+                                start_reg: target_register,
+                                count: std::num::NonZeroUsize::MIN,
+                                affinities: table_column.affinity().aff_mask().to_string(),
+                            });
                         } else {
                             // Either:
                             // 1. Regular column (not virtual generated), or
@@ -4630,13 +4638,18 @@ pub fn translate_expr(
                         let Some(column) = table.get_column_at(*column) else {
                             crate::bail_parse_error!("column index out of bounds");
                         };
+                        // Apply RealAffinity for stored columns read from cursor/index.
+                        // Virtual generated columns already had full affinity applied above.
                         // Skip affinity for custom types — the stored value is
                         // already in BASE type format; the custom type name may
                         // produce wrong affinity (e.g. "doubled" → REAL due to "DOUB").
-                        if resolver
-                            .schema()
-                            .get_type_def(&column.ty_str, table.is_strict())
-                            .is_none()
+                        let virtual_already_applied =
+                            table_column.is_virtual_generated() && !read_from_index;
+                        if !virtual_already_applied
+                            && resolver
+                                .schema()
+                                .get_type_def(&column.ty_str, table.is_strict())
+                                .is_none()
                         {
                             maybe_apply_affinity(column.ty(), target_register, program);
                         }
@@ -6562,29 +6575,10 @@ fn wrap_eval_jump_expr_zero_or_null(
 }
 
 pub fn maybe_apply_affinity(col_type: Type, target_register: usize, program: &mut ProgramBuilder) {
-    match col_type {
-        Type::Real => {
-            program.emit_insn(Insn::RealAffinity {
-                register: target_register,
-            });
-        }
-        Type::Integer => {
-            program.emit_insn(Insn::Affinity {
-                start_reg: target_register,
-                count: std::num::NonZeroUsize::MIN,
-                affinities: Affinity::Integer.aff_mask().to_string(),
-            });
-        }
-        Type::Numeric => {
-            program.emit_insn(Insn::Affinity {
-                start_reg: target_register,
-                count: std::num::NonZeroUsize::MIN,
-                affinities: Affinity::Numeric.aff_mask().to_string(),
-            });
-        }
-        Type::Null | Type::Text | Type::Blob => {
-            // No affinity conversion needed
-        }
+    if col_type == Type::Real {
+        program.emit_insn(Insn::RealAffinity {
+            register: target_register,
+        });
     }
 }
 

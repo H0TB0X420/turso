@@ -3652,7 +3652,6 @@ impl Column {
         Ok(())
     }
 
-    /// Returns true if this is a VIRTUAL generated column (all generated columns are VIRTUAL)
     #[inline]
     pub fn is_virtual_generated(&self) -> bool {
         self.generated.is_some()
