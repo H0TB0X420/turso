@@ -509,8 +509,6 @@ impl TursoMcpServer {
                             format!("DEFAULT {default_value}")
                         };
 
-                        // Determine if this is a generated column
-                        // hidden: 0=normal, 2=VIRTUAL generated
                         let generated_str = match hidden {
                             DbValue::Numeric(Numeric::Integer(2)) => " VIRTUAL GENERATED",
                             _ => "",
