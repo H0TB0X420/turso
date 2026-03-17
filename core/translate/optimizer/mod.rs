@@ -884,7 +884,7 @@ fn first_update_safety_reason(
                 return true;
             }
             // Check if this is a generated column that depends on any updated column
-            if btree_table.columns[c.pos_in_table].generated.is_some() {
+            if btree_table.columns[c.pos_in_table].is_generated() {
                 let mut visited = HashSet::default();
                 return column_depends_on_updated(
                     c.pos_in_table,
@@ -2915,7 +2915,7 @@ fn ephemeral_index_build(
         .enumerate()
         .map(|(i, c)| {
             let (expr, affinity) = if c.is_virtual_generated() {
-                (c.generated.clone().map(|e| *e), Some(c.affinity()))
+                (c.generated_expr_cloned(), Some(c.affinity()))
             } else {
                 (None, None)
             };

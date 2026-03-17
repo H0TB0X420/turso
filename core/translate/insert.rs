@@ -2644,7 +2644,7 @@ pub fn compute_virtual_columns_for_triggers<'a>(
 ) -> Result<()> {
     for col_mapping in col_mappings {
         if col_mapping.column.is_virtual_generated() {
-            if let Some(gen_expr) = &col_mapping.column.generated {
+            if let Some(gen_expr) = col_mapping.column.generated_expr() {
                 translate_generated_expr(
                     program,
                     gen_expr,
@@ -2678,7 +2678,7 @@ fn translate_generated_expr<'a>(
         col_mappings,
         rowid_alias,
     };
-    translate_expr_with_context(program, &context, expr, target_register, resolver)?;
+    translate_expr_with_context(program, &context, Box::new(expr.clone()), target_register, resolver)?;
     Ok(())
 }
 
@@ -3366,7 +3366,7 @@ fn emit_index_column_value_for_insert(
             col_mappings: &insertion.col_mappings,
             rowid_alias,
         };
-        translate_expr_with_context(program, &context, expr.as_ref(), dest_reg, resolver)?;
+        translate_expr_with_context(program, &context, expr.clone(), dest_reg, resolver)?;
         // Apply column affinity for VIRTUAL columns. This ensures INTEGER->REAL
         // conversions (and other affinity rules) happen per SQLite's documentation.
         if let Some(affinity) = &idx_col.affinity {

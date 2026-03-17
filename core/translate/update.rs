@@ -459,6 +459,7 @@ pub fn prepare_update_plan(
     let column_lookup: HashMap<String, usize> = columns
         .iter()
         .enumerate()
+        //TODO use normalize_ident
         .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
         .collect();
 
@@ -480,7 +481,7 @@ pub fn prepare_update_plan(
                             return true;
                         }
                         // If column in expression is a generated column, check transitive deps
-                        if columns[cidx].generated.is_some() {
+                        if columns[cidx].is_generated() {
                             let mut visited = HashSet::default();
                             return column_depends_on_updated(
                                 cidx,
@@ -498,7 +499,7 @@ pub fn prepare_update_plan(
                 } else if updated_cols.contains(&col.pos_in_table) {
                     needs = true;
                     break;
-                } else if columns[col.pos_in_table].generated.is_some() {
+                } else if columns[col.pos_in_table].is_generated() {
                     // Check if this column is a generated column and if any of its
                     // dependencies are being updated. This uses transitive checking to
                     // handle chains like: generated -> VIRTUAL -> regular column.
@@ -595,7 +596,7 @@ pub fn column_depends_on_updated(
             use crate::schema::GenColDepsAction;
             if updated_cols.contains(&dep_idx) {
                 GenColDepsAction::Stop
-            } else if dep_col.generated.is_some() {
+            } else if dep_col.is_generated() {
                 GenColDepsAction::Recurse
             } else {
                 GenColDepsAction::Skip

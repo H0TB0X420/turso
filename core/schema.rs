@@ -1890,6 +1890,10 @@ pub enum Table {
     FromClauseSubquery(Arc<FromClauseSubquery>),
 }
 
+//FIXME
+// 1 - this needs to use normalize_ident
+// 2 - this is called way too many times, it should be cached somewhere
+// 3 - for now we could just brute-force the search
 /// Build a map from lowercased column names to their indices.
 pub fn build_column_name_lookup(columns: &[Column]) -> HashMap<String, usize> {
     columns
@@ -2219,7 +2223,7 @@ impl BTreeTable {
                 sql.push_str(&default.to_string());
             }
 
-            if let Some(generated) = &column.generated {
+            if let GeneratedType::Virtual(generated) = &column.generated_type {
                 sql.push_str(" AS (");
                 sql.push_str(&generated.to_string());
                 sql.push(')');
@@ -2370,7 +2374,7 @@ impl BTreeTable {
             if i == logical {
                 break;
             }
-            if !col.is_virtual_generated() {
+            if col.is_storable() {
                 physical += 1;
             }
         }
@@ -2517,7 +2521,7 @@ where
     if !visited.insert(start_idx) {
         return false;
     }
-    let Some(ref expr) = columns[start_idx].generated else {
+    let GeneratedType::Virtual(ref expr) = columns[start_idx].generated_type else {
         return false;
     };
     for ref_name in collect_column_refs(expr) {
@@ -2558,7 +2562,7 @@ fn has_transitive_dependency(
         return false; // Not a generated column or doesn't exist yet
     };
 
-    let Some(ref gen_expr) = col.generated else {
+    let GeneratedType::Virtual(ref gen_expr) = col.generated_type else {
         return false; // Not a generated column
     };
 
@@ -3432,7 +3436,7 @@ pub struct Column {
     pub ty_str: String,
     pub ty_params: Vec<Box<Expr>>,
     pub default: Option<Box<Expr>>,
-    pub generated: Option<Box<Expr>>,
+    pub generated_type: GeneratedType,
     raw: u16,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
     pub notnull_conflict_clause: Option<ResolveType>,
@@ -3446,6 +3450,26 @@ pub struct ColDef {
     pub unique: bool,
     pub hidden: bool,
     pub notnull_conflict_clause: Option<ResolveType>,
+}
+
+#[derive(Debug, Clone)]
+pub enum GeneratedType {
+    Virtual(Box<Expr>),
+    // Stored(Box<Expr>),
+    NotGenerated,
+}
+
+impl GeneratedType {
+    pub fn from_expr(expr: Option<Box<Expr>>) -> Self {
+        match expr {
+            Some(expr) => Self::Virtual(expr),
+            None => Self::NotGenerated,
+        }
+    }
+
+    pub fn is_storable(&self) -> bool {
+        !matches!(self, GeneratedType::Virtual(_))
+    }
 }
 
 // flags
@@ -3547,6 +3571,7 @@ impl Column {
         col: Option<CollationSeq>,
         coldef: ColDef,
     ) -> Self {
+        let generated_type = GeneratedType::from_expr(generated);
         let mut raw = 0u16;
         raw |= (ty as u16) << TYPE_SHIFT;
         if let Some(c) = col {
@@ -3572,7 +3597,7 @@ impl Column {
             ty_str,
             ty_params: Vec::new(),
             default,
-            generated,
+            generated_type,
             raw,
             notnull_conflict_clause: coldef.notnull_conflict_clause,
         }
@@ -3637,24 +3662,57 @@ impl Column {
         self.raw & F_HIDDEN != 0
     }
 
-    /// Returns true if this is a generated column (VIRTUAL or STORED)
-    #[inline]
-    pub fn is_generated(&self) -> bool {
-        self.generated.is_some()
-    }
-
     /// Returns an error if this column is a generated column.
     /// `verb_phrase` should describe the operation, e.g. "INSERT into" or "UPDATE".
     pub fn ensure_not_generated(&self, verb_phrase: &str, col_name: &str) -> crate::Result<()> {
-        if self.is_generated() {
+        if !matches!(self.generated_type, GeneratedType::NotGenerated) {
             crate::bail_parse_error!("cannot {} generated column \"{}\"", verb_phrase, col_name);
         }
         Ok(())
     }
 
     #[inline]
-    pub fn is_virtual_generated(&self) -> bool {
-        self.generated.is_some()
+    pub fn generated_type(&self) -> &GeneratedType {
+        &self.generated_type
+    }
+
+    #[inline]
+    pub const fn is_generated(&self) -> bool {
+        !matches!(self.generated_type, GeneratedType::NotGenerated)
+    }
+
+    #[inline]
+    pub const fn is_virtual_generated(&self) -> bool {
+        matches!(self.generated_type, GeneratedType::Virtual(_))
+    }
+
+    #[inline]
+    pub fn generated_expr(&self) -> Option<&Expr> {
+        match &self.generated_type {
+            GeneratedType::Virtual(expr) => Some(expr.as_ref()),
+            GeneratedType::NotGenerated => None,
+        }
+    }
+
+    #[inline]
+    pub fn generated_expr_mut(&mut self) -> Option<&mut Expr> {
+        match &mut self.generated_type {
+            GeneratedType::Virtual(expr) => Some(expr.as_mut()),
+            GeneratedType::NotGenerated => None,
+        }
+    }
+
+    #[inline]
+    pub fn generated_expr_box(&self) -> Option<Box<Expr>> {
+        match &self.generated_type {
+            GeneratedType::Virtual(expr) => Some(expr.clone()),
+            GeneratedType::NotGenerated => None,
+        }
+    }
+
+    #[inline]
+    pub fn generated_expr_cloned(&self) -> Option<Expr> {
+        self.generated_expr().cloned()
     }
 
     #[inline]
@@ -3702,6 +3760,11 @@ impl Column {
         } else {
             self.raw &= !mask
         }
+    }
+
+    /// true if the column must be stored on disk (e.g. it's not a VIRTUAL column)
+    pub fn is_storable(&self) -> bool {
+        self.generated_type.is_storable()
     }
 }
 
@@ -4929,52 +4992,5 @@ mod tests {
         assert!(matches!(index.columns[0].order, SortOrder::Asc));
 
         Ok(())
-    }
-
-    #[test]
-    fn test_virtual_generated_columns() -> Result<()> {
-        let sql = r#"CREATE TABLE t (
-          a REAL,
-          b INTEGER AS (a),
-          c REAL AS (b),
-          d INTEGER AS (- (c - (141 - c)))
-        );"#;
-        let table = BTreeTable::from_sql(sql, 0)?;
-
-        // Column a should be regular (not generated)
-        let col_a = table.get_column("a").unwrap().1;
-        assert!(!col_a.is_generated(), "column 'a' should not be generated");
-
-        // Column b should be VIRTUAL generated (default)
-        let col_b = table.get_column("b").unwrap().1;
-        assert!(col_b.is_generated(), "column 'b' should be generated");
-        assert!(col_b.is_virtual_generated(), "column 'b' should be VIRTUAL");
-
-        // Column c should be VIRTUAL generated (default)
-        let col_c = table.get_column("c").unwrap().1;
-        assert!(col_c.is_generated(), "column 'c' should be generated");
-        assert!(col_c.is_virtual_generated(), "column 'c' should be VIRTUAL");
-
-        // Column d should be VIRTUAL generated (default)
-        let col_d = table.get_column("d").unwrap().1;
-        assert!(col_d.is_generated(), "column 'd' should be generated");
-        assert!(col_d.is_virtual_generated(), "column 'd' should be VIRTUAL");
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_stored_generated_columns_rejected() {
-        let sql = r#"CREATE TABLE t (a REAL, b INTEGER GENERATED ALWAYS AS (a) STORED);"#;
-        let result = BTreeTable::from_sql(sql, 0);
-        assert!(
-            result.is_err(),
-            "STORED generated columns should be rejected"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("STORED generated columns are not supported"),
-            "unexpected error: {err_msg}"
-        );
     }
 }

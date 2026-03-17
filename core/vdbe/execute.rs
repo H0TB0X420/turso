@@ -11933,7 +11933,7 @@ pub fn op_alter_column(
 
         // Update generated column expressions that reference the renamed column.
         for other_col in &mut btree.columns {
-            if let Some(ref mut gen_expr) = other_col.generated {
+            if let Some(gen_expr) = other_col.generated_expr_mut() {
                 rename_column_refs_in_expr(gen_expr, &old_column_name, &new_name);
             }
         }

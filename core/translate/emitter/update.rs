@@ -1326,7 +1326,7 @@ fn emit_update_insns<'a>(
         let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
         for (idx, col) in columns.iter().enumerate() {
             if col.is_virtual_generated() {
-                if let Some(gen_expr) = &col.generated {
+                if let Some(gen_expr) = col.generated_expr() {
                     emit_generated_expr_from_registers(
                         program,
                         gen_expr,
@@ -2499,7 +2499,7 @@ pub(super) fn emit_generated_expr_from_registers(
         columns,
         rowid_reg,
     };
-    translate_expr_with_context(program, &context, expr, target_reg, resolver)?;
+    translate_expr_with_context(program, &context, Box::new(expr.clone()), target_reg, resolver)?;
     Ok(())
 }
 
@@ -2528,7 +2528,7 @@ pub(super) fn compute_virtual_columns_for_update(
 
     for (idx, column) in columns.iter().enumerate() {
         if column.is_virtual_generated() {
-            if let Some(gen_expr) = &column.generated {
+            if let Some(gen_expr) = column.generated_expr() {
                 match registers {
                     VirtualColumnRegisters::Contiguous {
                         registers_start,
@@ -2555,7 +2555,11 @@ pub(super) fn compute_virtual_columns_for_update(
                             columns,
                         };
                         translate_expr_with_context(
-                            program, &context, gen_expr, target_reg, resolver,
+                            program,
+                            &context,
+                            Box::new(gen_expr.clone()),
+                            target_reg,
+                            resolver,
                         )?;
                         program.emit_column_affinity(target_reg, column.affinity());
                     }

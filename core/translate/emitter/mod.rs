@@ -761,11 +761,11 @@ pub(super) fn emit_make_record_without_virtual_columns<'a>(
             });
         }
         (record_start, storable_count)
-    } else if let Some(&(first_reg, _)) = storable_cols.first() {
-        (first_reg, storable_count)
     } else {
-        //TODO what does this mean??
-        return;
+        let &(first_reg, _) = storable_cols
+            .first()
+            .expect("there should be at least 1 storable column");
+        (first_reg, storable_count)
     };
 
     let affinity_str: String = storable_cols
@@ -792,6 +792,7 @@ pub fn emit_cdc_full_record(
     let columns_reg = program.alloc_registers(columns.len() + 1);
     for (i, column) in columns.iter().enumerate() {
         if column.is_virtual_generated() {
+            //TODO compute generated column
             program.emit_null(columns_reg + 1 + i, None);
         } else if column.is_rowid_alias() {
             program.emit_insn(Insn::Copy {
@@ -1469,13 +1470,11 @@ fn emit_index_column_value_new_image(
             .get(idx_col.pos_in_table)
             .expect("column index out of bounds");
         if col_in_table.is_virtual_generated() {
-            // Evaluate the generated expression using the NEW values from registers.
             let column_lookup = crate::schema::build_column_name_lookup(columns);
             update::emit_generated_expr_from_registers(
                 program,
                 col_in_table
-                    .generated
-                    .as_ref()
+                    .generated_expr()
                     .expect("virtual generated column must have expression"),
                 dest_reg,
                 columns_start_reg,

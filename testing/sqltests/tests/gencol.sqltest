@@ -2343,10 +2343,43 @@ expect {
     5|1|9
 }
 
+# Virtual generated columns with REAL->INTEGER->REAL->INTEGER affinity chain
+# Verifies that all columns in the dependency chain are correctly identified
+# as VIRTUAL generated and that affinity is applied at each step.
+test gencol_virtual_affinity_chain {
+    CREATE TABLE t (
+        a REAL,
+        b INTEGER AS (a),
+        c REAL AS (b),
+        d INTEGER AS (- (c - (141 - c)))
+    );
+    INSERT INTO t (a) VALUES (10.0);
+    SELECT typeof(a), typeof(b), typeof(c), typeof(d) FROM t;
+    SELECT a, b, c, d FROM t;
+}
+expect {
+    real|integer|real|integer
+    10.0|10|10.0|121
+}
+# JS Number omits .0 for whole numbers
+expect @js {
+    real|integer|real|integer
+    10|10|10|121
+}
+
 # Test that STORED generated columns are rejected with an error.
 @skip-if sqlite "SQLite supports STORED generated columns; turso does not"
 test gencol_stored_rejected {
     CREATE TABLE t1(a INTEGER, b INTEGER AS (a * 2) STORED);
 }
 expect error {
+}
+
+# STORED generated columns with explicit GENERATED ALWAYS syntax should also be rejected
+@skip-if sqlite "SQLite supports STORED generated columns; turso does not"
+test gencol_stored_generated_always_rejected {
+    CREATE TABLE t1(a REAL, b INTEGER GENERATED ALWAYS AS (a) STORED);
+}
+expect error {
+    STORED generated columns are not supported
 }

@@ -6,6 +6,7 @@ use rustc_hash::FxHashMap as HashMap;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, UnaryOperator};
 
+use super::collate::{get_collseq_from_expr, CollationSeq};
 use super::emitter::Resolver;
 use super::optimizer::Optimizable;
 use super::plan::TableReferences;
@@ -32,8 +33,6 @@ use crate::vdbe::{
 };
 use crate::{LimboError, Numeric, Result, Value};
 use std::collections::HashSet;
-
-use super::collate::{get_collseq_from_expr, CollationSeq};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ConditionMetadata {
@@ -221,9 +220,10 @@ thread_local! {
     static VIRTUAL_COL_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-struct VirtualColumnDepthGuard;
+//TODO could this mechanism be generalized to expressions? Also, rename to RecursionGuare
+struct VirtualColumnRecursionGuard;
 
-impl VirtualColumnDepthGuard {
+impl VirtualColumnRecursionGuard {
     fn new() -> Result<Self> {
         VIRTUAL_COL_DEPTH.with(|d| {
             let cur = d.get();
@@ -233,12 +233,12 @@ impl VirtualColumnDepthGuard {
                 );
             }
             d.set(cur + 1);
-            Ok(VirtualColumnDepthGuard)
+            Ok(VirtualColumnRecursionGuard)
         })
     }
 }
 
-impl Drop for VirtualColumnDepthGuard {
+impl Drop for VirtualColumnRecursionGuard {
     fn drop(&mut self) {
         VIRTUAL_COL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
     }
@@ -256,29 +256,20 @@ impl<'a> ExprContext<'a> {
     pub(crate) fn emit_virtual_column(
         &self,
         program: &mut ProgramBuilder,
-        col: &Column,
+        expr: Box<Expr>,
+        affinity: &Affinity,
         target_reg: usize,
         resolver: &Resolver,
     ) -> Result<()> {
-        debug_assert!(col.is_virtual_generated());
+        let _guard = VirtualColumnRecursionGuard::new()?;
 
-        // RAII guard ensures depth is decremented even on early error returns
-        let _guard = VirtualColumnDepthGuard::new()?;
-
-        let gen_expr = col
-            .generated
-            .as_ref()
-            .expect("is_virtual_generated() guarantees generated expr exists");
-        translate_expr_with_context(program, self, gen_expr, target_reg, resolver)?;
-        // Apply the VIRTUAL column's affinity to the result.
-        // This is critical for precision: e.g., if a VIRTUAL column has REAL
-        // affinity but its expression evaluates to INTEGER, we must convert
-        // to REAL so that any downstream expressions see the correct type.
+        translate_expr_with_context(program, self, expr, target_reg, resolver)?;
         program.emit_insn(Insn::Affinity {
             start_reg: target_reg,
             count: std::num::NonZeroUsize::MIN, // 1 register
-            affinities: col.affinity().aff_mask().to_string(),
+            affinities: affinity.aff_mask().to_string(),
         });
+
         Ok(())
     }
 
@@ -328,7 +319,15 @@ impl<'a> ExprContext<'a> {
 
                 if let Some(mapping) = mapping {
                     if mapping.column.is_virtual_generated() {
-                        self.emit_virtual_column(program, mapping.column, target_reg, resolver)?;
+                        let Some(expr) = mapping.column.generated_expr_box() else {
+                            crate::bail_parse_error!(
+                                "virtual generated column is missing expression"
+                            );
+                        };
+                        let affinity = mapping.column.affinity();
+                        self.emit_virtual_column(program, expr, &affinity, target_reg, resolver)?;
+                    }
+                    if mapping.column.is_virtual_generated() {
                     } else {
                         // Regular column - copy from the pre-loaded register
                         program.emit_insn(Insn::Copy {
@@ -452,10 +451,22 @@ impl<'a> ExprContext<'a> {
         resolver: &Resolver,
         emit_non_virtual: impl FnOnce(&mut ProgramBuilder, usize, &Column) -> Result<()>,
     ) -> Result<()> {
-        if let Some(&col_idx) = column_lookup.get(&col_name.to_lowercase()) {
+        if let Some(&col_idx) = column_lookup.get(&col_name.to_lowercase()) { //TODO is this the only place where the lookup is used? NO, there's 3 places, but they all have access to the columns anyways, so I should just build a struct that caches the lookup.
             if let Some(col) = columns.get(col_idx) {
                 if col.is_virtual_generated() {
-                    return self.emit_virtual_column(program, col, target_reg, resolver);
+                    let Some(expr) = col.generated_expr_box() else {
+                        crate::bail_parse_error!(
+                            "virtual generated column is missing expression"
+                        );
+                    };
+                    let affinity = col.affinity();
+                    return self.emit_virtual_column(
+                        program,
+                        expr,
+                        &affinity,
+                        target_reg,
+                        resolver,
+                    );
                 }
             }
             let col = &columns[col_idx];
@@ -600,27 +611,27 @@ impl<'a> ExprContext<'a> {
 pub fn translate_expr_with_context(
     program: &mut ProgramBuilder,
     context: &ExprContext<'_>,
-    expr: &ast::Expr,
+    expr: Box<Expr>,
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
     match context {
         ExprContext::Query { referenced_tables } => {
             // Delegate to the existing translate_expr for now
-            translate_expr(program, *referenced_tables, expr, target_register, resolver)
+            translate_expr(program, *referenced_tables, &expr, target_register, resolver)
         }
         ExprContext::VirtualColumn { .. } => {
             // Use the unified implementation for virtual column expressions
             // Column references (Expr::Id) are resolved via context.resolve_column_by_name(),
             // which creates Expr::Column and delegates back to translate_expr for cursor access.
-            translate_generated_expr_unified(program, context, expr, target_register, resolver)?;
+            translate_generated_expr_unified(program, context, &expr, target_register, resolver)?;
             Ok(target_register)
         }
         // For generated column contexts, use the unified implementation
         ExprContext::InsertGenerated { .. }
         | ExprContext::UpdateGenerated { .. }
         | ExprContext::OldGenerated { .. } => {
-            translate_generated_expr_unified(program, context, expr, target_register, resolver)?;
+            translate_generated_expr_unified(program, context, &expr, target_register, resolver)?;
             Ok(target_register)
         }
     }
@@ -4564,8 +4575,8 @@ pub fn translate_expr(
                             // We need to evaluate the generated expression.
                             // However, if we're reading from an index that contains this VIRTUAL column,
                             // the index already has the pre-computed value - we can read it directly.
-                            // is_virtual_generated() guarantees that table_column.generated is Some.
-                            let gen_expr = table_column.generated.as_ref().expect(
+                            // is_virtual_generated() guarantees that the generated expression exists.
+                            let gen_expr = table_column.generated_expr().expect(
                                 "is_virtual_generated() guarantees generated expression exists",
                             );
                             // For virtual columns, we translate the generated expression.
@@ -4578,7 +4589,7 @@ pub fn translate_expr(
                             translate_expr_with_context(
                                 program,
                                 &context,
-                                gen_expr,
+                                Box::new(gen_expr.clone()),
                                 target_register,
                                 resolver,
                             )?;
@@ -4606,13 +4617,13 @@ pub fn translate_expr(
                                     index_cursor_id.expect("index cursor should be opened"),
                                 );
                                 index
-                                        .column_table_pos_to_index_pos(*column)
-                                        .unwrap_or_else(|| {
-                                            panic!(
+                                    .column_table_pos_to_index_pos(*column)
+                                    .unwrap_or_else(|| {
+                                        panic!(
                                             "index {} does not contain column number {} of table {}",
                                             index.name, column, table_ref_id
                                         )
-                                        })
+                                    })
                             } else {
                                 *column
                             };

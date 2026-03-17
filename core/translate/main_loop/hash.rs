@@ -422,9 +422,16 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                             table_ref_id: build_table.internal_id,
                             referenced_tables: Some(planner.table_references),
                         };
+                        let Some(expr) = column.generated_expr_box() else {
+                            crate::bail_parse_error!(
+                                "virtual generated column is missing expression"
+                            );
+                        };
+                        let affinity = column.affinity();
                         context.emit_virtual_column(
                             planner.program,
-                            column,
+                            expr,
+                            &affinity,
                             payload_reg + i,
                             &planner.t_ctx.resolver,
                         )?;

@@ -570,7 +570,7 @@ pub fn resolve_sorted_columns(
             // Also store the column's affinity so it can be applied during index population
             // (INTEGER→REAL conversions, etc., per SQLite's affinity rules).
             let (expr, affinity) = if column.is_virtual_generated() {
-                (column.generated.clone(), Some(column.affinity()))
+                (column.generated_expr_box(), Some(column.affinity()))
             } else {
                 (None, None)
             };

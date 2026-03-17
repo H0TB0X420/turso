@@ -667,7 +667,7 @@ pub fn translate_alter_table(
 
             // Check if column is referenced by any generated column expression
             for col in btree.columns.iter() {
-                if let Some(ref generated_expr) = col.generated {
+                if let Some(generated_expr) = col.generated_expr() {
                     let refs = crate::schema::collect_column_refs(generated_expr);
                     if refs.contains(&column_name_norm) {
                         let gen_col_name = col.name.as_deref().unwrap_or("<unnamed>");
@@ -851,7 +851,7 @@ pub fn translate_alter_table(
 
             // Validate generated column constraints.
             // Column::from() does not perform this validation, so we must do it here.
-            if column.generated.is_some() {
+            if column.is_generated() {
                 if column.primary_key() {
                     return Err(LimboError::ParseError(format!(
                         "generated column \"{}\" cannot be part of the PRIMARY KEY",
@@ -864,7 +864,12 @@ pub fn translate_alter_table(
                         column.name.as_deref().unwrap_or("?")
                     )));
                 }
-                crate::schema::validate_generated_expr(column.generated.as_ref().unwrap(), None)?;
+                crate::schema::validate_generated_expr(
+                    column
+                        .generated_expr()
+                        .expect("is_generated guarantees expression exists"),
+                    None,
+                )?;
             }
 
             // SQLite is very strict about what constitutes a "constant" default for
@@ -1331,7 +1336,7 @@ pub fn translate_alter_table(
                     .columns
                     .iter()
                     .enumerate()
-                    .filter(|(idx, col)| *idx != column_index && col.generated.is_none())
+                    .filter(|(idx, col)| *idx != column_index && !col.is_generated())
                     .count();
 
                 if non_generated_count == 0 {
