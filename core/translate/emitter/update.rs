@@ -2101,8 +2101,12 @@ fn emit_update_insns<'a>(
         let record_reg = program.alloc_register();
         emit_make_record_without_virtual_columns(
             program,
-            target_table.table.columns(),
-            start,
+            target_table
+                .table
+                .columns()
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (start + i, c)),
             record_reg,
             target_table.table.btree().is_some_and(|bt| bt.is_strict),
         );

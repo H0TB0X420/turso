@@ -10,7 +10,8 @@ use crate::{
         emitter::{
             delete::emit_fk_child_decrement_on_delete, emit_cdc_autocommit_commit,
             emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, emit_check_constraints,
-            prepare_cdc_if_necessary, OperationMode, Resolver,
+            emit_make_record_without_virtual_columns, prepare_cdc_if_necessary, OperationMode,
+            Resolver,
         },
         expr::{
             bind_and_rewrite_expr, emit_returning_results, emit_returning_scan_back,
@@ -825,50 +826,15 @@ pub fn translate_insert(
 
     // Create and insert the record
     // VIRTUAL generated columns are not stored, so we need to exclude them from the record.
-    let (record_start_reg, record_col_count, affinity_str) = if insertion.has_virtual_columns() {
-        // Allocate contiguous registers for storable columns and copy values
-        let storable_count = insertion.storable_count();
-        let start_reg = program.alloc_registers(storable_count);
-        let mut affinity = String::with_capacity(storable_count);
-        for (i, col_mapping) in insertion.storable_columns().enumerate() {
-            program.emit_insn(Insn::Copy {
-                src_reg: col_mapping.register,
-                dst_reg: start_reg + i,
-                extra_amount: 0,
-            });
-            affinity.push(
-                col_mapping
-                    .column
-                    .affinity_with_strict(ctx.table.is_strict)
-                    .aff_mask(),
-            );
-        }
-        (start_reg, storable_count, affinity)
-    } else {
-        let affinity_str = insertion
+    emit_make_record_without_virtual_columns(
+        program,
+        insertion
             .col_mappings
             .iter()
-            .map(|col_mapping| {
-                col_mapping
-                    .column
-                    .affinity_with_strict(ctx.table.is_strict)
-                    .aff_mask()
-            })
-            .collect::<String>();
-        (
-            insertion.first_col_register(),
-            insertion.col_mappings.len(),
-            affinity_str,
-        )
-    };
-
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(record_start_reg),
-        count: to_u16(record_col_count),
-        dest_reg: to_u16(insertion.record_register()),
-        index_name: None,
-        affinity_str: Some(affinity_str),
-    });
+            .map(|m| (m.register, m.column)),
+        insertion.record_register(),
+        ctx.table.is_strict,
+    );
 
     if has_fks {
         // Child-side FK check must run before any writes (IdxInsert / Insert).
@@ -2256,21 +2222,6 @@ impl<'a> Insertion<'a> {
         self.col_mappings
             .iter()
             .any(|m| m.column.is_virtual_generated())
-    }
-
-    /// Returns an iterator over storable (non-virtual) column mappings.
-    pub fn storable_columns(&self) -> impl Iterator<Item = &ColMapping<'a>> {
-        self.col_mappings
-            .iter()
-            .filter(|m| !m.column.is_virtual_generated())
-    }
-
-    /// Returns the count of storable (non-virtual) columns.
-    pub fn storable_count(&self) -> usize {
-        self.col_mappings
-            .iter()
-            .filter(|m| !m.column.is_virtual_generated())
-            .count()
     }
 
     /// Returns the column mapping for a given column name.

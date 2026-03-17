@@ -1020,8 +1020,11 @@ pub fn emit_upsert(
     let rec = program.alloc_register();
     emit_make_record_without_virtual_columns(
         program,
-        table.columns(),
-        new_start,
+        table
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (new_start + i, c)),
         rec,
         table.btree().is_some_and(|bt| bt.is_strict),
     );

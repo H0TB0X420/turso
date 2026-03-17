@@ -725,37 +725,47 @@ pub fn emit_cdc_patch_record(
     }
 }
 
-pub(super) fn emit_make_record_without_virtual_columns(
+/// Emit a MakeRecord that excludes VIRTUAL generated columns.
+///
+/// Accepts an iterator of `(source_register, &Column)` pairs representing
+/// every column (including virtual ones). Virtual columns are filtered out,
+/// and the remaining values are copied into a fresh contiguous register
+/// block so that MakeRecord sees no gaps. If there are no virtual columns,
+/// the original registers are used directly (no copy).
+pub(super) fn emit_make_record_without_virtual_columns<'a>(
     program: &mut ProgramBuilder,
-    columns: &[Column],
-    source_start: usize,
+    cols: impl IntoIterator<Item = (usize, &'a Column)>,
     dest_reg: usize,
     is_strict: bool,
 ) {
-    let storable_cols: Vec<(usize, &Column)> = columns
+    let all_cols: Vec<(usize, &Column)> = cols.into_iter().collect();
+    let storable_cols: Vec<(usize, &Column)> = all_cols
         .iter()
-        .enumerate()
         .filter(|(_, c)| !c.is_virtual_generated())
+        .copied()
         .collect();
     let storable_count = storable_cols.len();
 
-    let (record_start, record_count) = if storable_count < columns.len() {
+    let (record_start, record_count) = if storable_count < all_cols.len() {
         // There are virtual columns; create a compact representation by
         // copying all storable columns to contiguous registers.
         // TODO we can compact in-place if any of these is true:
         //  - there are no FKs of AFTER triggers
         //  - all virtual columns are trailing
         let record_start = program.alloc_registers(storable_count);
-        for (compact_idx, &(orig_idx, _)) in storable_cols.iter().enumerate() {
+        for (compact_idx, &(src_reg, _)) in storable_cols.iter().enumerate() {
             program.emit_insn(Insn::Copy {
-                src_reg: source_start + orig_idx,
+                src_reg,
                 dst_reg: record_start + compact_idx,
                 extra_amount: 0,
             });
         }
         (record_start, storable_count)
+    } else if let Some(&(first_reg, _)) = storable_cols.first() {
+        (first_reg, storable_count)
     } else {
-        (source_start, columns.len())
+        //TODO what does this mean??
+        return;
     };
 
     let affinity_str: String = storable_cols
