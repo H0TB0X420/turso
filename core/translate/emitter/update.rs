@@ -12,7 +12,7 @@ use crate::{
             check_expr_references_columns, delete::emit_fk_child_decrement_on_delete,
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
             emit_cdc_patch_record, emit_check_constraints, emit_index_column_value_new_image,
-            emit_index_column_value_old_image, emit_make_record_without_virtual,
+            emit_index_column_value_old_image, emit_make_record_without_virtual_columns,
             emit_program_for_select, init_limit, rewrite_where_for_update_registers, OperationMode,
             Resolver, UpdateRowSource,
         },
@@ -2099,7 +2099,7 @@ fn emit_update_insns<'a>(
 
     if target_table.table.btree().is_some() {
         let record_reg = program.alloc_register();
-        emit_make_record_without_virtual(
+        emit_make_record_without_virtual_columns(
             program,
             target_table.table.columns(),
             start,

@@ -332,7 +332,6 @@ expect {
 }
 
 # Adding a STORED generated column via ALTER TABLE should error
-# (VIRTUAL is allowed since it doesn't require backfilling existing rows)
 test alter-table-add-generated-column-error {
     CREATE TABLE t(a);
     ALTER TABLE t ADD COLUMN b AS (NULL) STORED;

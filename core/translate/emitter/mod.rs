@@ -725,30 +725,28 @@ pub fn emit_cdc_patch_record(
     }
 }
 
-/// Emit a MakeRecord instruction that excludes VIRTUAL generated columns.
-///
-/// VIRTUAL columns are computed on-the-fly during reads and should not be stored.
-/// When the table has VIRTUAL columns, this function copies the storable (non-VIRTUAL)
-/// columns into contiguous registers before emitting MakeRecord.
-///
-/// Returns the register containing the record.
-pub(super) fn emit_make_record_without_virtual(
+pub(super) fn emit_make_record_without_virtual_columns(
     program: &mut ProgramBuilder,
     columns: &[Column],
     source_start: usize,
     dest_reg: usize,
     is_strict: bool,
 ) {
-    let storable: Vec<(usize, &Column)> = columns
+    let storable_cols: Vec<(usize, &Column)> = columns
         .iter()
         .enumerate()
         .filter(|(_, c)| !c.is_virtual_generated())
         .collect();
-    let storable_count = storable.len();
+    let storable_count = storable_cols.len();
 
     let (record_start, record_count) = if storable_count < columns.len() {
+        // There are virtual columns; create a compact representation by
+        // copying all storable columns to contiguous registers.
+        // TODO we can compact in-place if any of these is true:
+        //  - there are no FKs of AFTER triggers
+        //  - all virtual columns are trailing
         let record_start = program.alloc_registers(storable_count);
-        for (compact_idx, &(orig_idx, _)) in storable.iter().enumerate() {
+        for (compact_idx, &(orig_idx, _)) in storable_cols.iter().enumerate() {
             program.emit_insn(Insn::Copy {
                 src_reg: source_start + orig_idx,
                 dst_reg: record_start + compact_idx,
@@ -760,7 +758,7 @@ pub(super) fn emit_make_record_without_virtual(
         (source_start, columns.len())
     };
 
-    let affinity_str: String = storable
+    let affinity_str: String = storable_cols
         .iter()
         .map(|(_, c)| c.affinity_with_strict(is_strict).aff_mask())
         .collect();
@@ -1461,7 +1459,6 @@ fn emit_index_column_value_new_image(
             .get(idx_col.pos_in_table)
             .expect("column index out of bounds");
         if col_in_table.is_virtual_generated() {
-            // VIRTUAL columns are not stored in registers during UPDATE (they hold NULL).
             // Evaluate the generated expression using the NEW values from registers.
             let column_lookup = crate::schema::build_column_name_lookup(columns);
             update::emit_generated_expr_from_registers(

@@ -7,7 +7,7 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{BTreeTable, IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::{
-    emit_check_constraints, emit_make_record_without_virtual, UpdateRowSource,
+    emit_check_constraints, emit_make_record_without_virtual_columns, UpdateRowSource,
 };
 use crate::translate::expr::{rewrite_between_expr, walk_expr, WalkControl};
 use crate::translate::fkeys::{
@@ -1018,7 +1018,7 @@ pub fn emit_upsert(
 
     // Build NEW table payload (excluding VIRTUAL columns)
     let rec = program.alloc_register();
-    emit_make_record_without_virtual(
+    emit_make_record_without_virtual_columns(
         program,
         table.columns(),
         new_start,
