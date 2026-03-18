@@ -616,47 +616,49 @@ fn emit_update_column_values<'a>(
             }
         } else {
             // Column is not being updated, read it from the table
-            // Skip VIRTUAL generated columns - they are computed on-the-fly and not stored
-            if table_column.is_virtual_generated() {
-                // VIRTUAL columns are not stored, emit NULL as placeholder
-                // (the actual value will be computed during SELECT)
-                program.emit_null(target_reg, None);
-            } else {
-                let column_idx_in_index = index.as_ref().and_then(|(idx, _)| {
-                    idx.columns.iter().position(|c| {
-                        table_column
-                            .name
-                            .as_ref()
-                            .is_some_and(|tc_name| c.name.eq_ignore_ascii_case(tc_name))
-                    })
-                });
-
-                // don't emit null for pkey of virtual tables. they require first two args
-                // before the 'record' to be explicitly non-null
-                if table_column.is_rowid_alias() && !is_virtual {
+            match table_column.generated_type() {
+                GeneratedType::Virtual(_) => {
+                    //TODO this forces a copy pass for record compaction in mod.rs:747,
+                    // see if instead I can avoid the placeholder here.
                     program.emit_null(target_reg, None);
-                } else if is_virtual {
-                    program.emit_insn(Insn::VColumn {
-                        cursor_id: target_table_cursor_id,
-                        column: idx,
-                        dest: target_reg,
-                    });
-                } else {
-                    let cursor_id = *index
-                        .as_ref()
-                        .and_then(|(_, id)| {
-                            if column_idx_in_index.is_some() {
-                                Some(id)
-                            } else {
-                                None
-                            }
+                }
+                GeneratedType::NotGenerated => {
+                    let column_idx_in_index = index.as_ref().and_then(|(idx, _)| {
+                        idx.columns.iter().position(|c| {
+                            table_column
+                                .name
+                                .as_ref()
+                                .is_some_and(|tc_name| c.name.eq_ignore_ascii_case(tc_name))
                         })
-                        .unwrap_or(&target_table_cursor_id);
-                    program.emit_column_or_rowid(
-                        cursor_id,
-                        column_idx_in_index.unwrap_or(idx),
-                        target_reg,
-                    );
+                    });
+
+                    // don't emit null for pkey of virtual tables. they require first two args
+                    // before the 'record' to be explicitly non-null
+                    if table_column.is_rowid_alias() && !is_virtual {
+                        program.emit_null(target_reg, None);
+                    } else if is_virtual {
+                        program.emit_insn(Insn::VColumn {
+                            cursor_id: target_table_cursor_id,
+                            column: idx,
+                            dest: target_reg,
+                        });
+                    } else {
+                        let cursor_id = *index
+                            .as_ref()
+                            .and_then(|(_, id)| {
+                                if column_idx_in_index.is_some() {
+                                    Some(id)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(&target_table_cursor_id);
+                        program.emit_column_or_rowid(
+                            cursor_id,
+                            column_idx_in_index.unwrap_or(idx),
+                            target_reg,
+                        );
+                    }
                 }
             }
 
