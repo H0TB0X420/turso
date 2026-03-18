@@ -2659,7 +2659,6 @@ pub fn compute_virtual_columns_for_triggers<'a>(
     let columns: Vec<Column> = col_mappings.iter().map(|cm| cm.column.clone()).collect();
 
     let saved_context = program.self_table_context.take();
-    super::expr::set_self_table_affinities(&columns);
     program.self_table_context = Some(SelfTableContext::Registers {
         column_regs,
         columns,
@@ -2673,7 +2672,6 @@ pub fn compute_virtual_columns_for_triggers<'a>(
         }
     }
 
-    super::expr::clear_self_table_affinities();
     program.self_table_context = saved_context;
     Ok(())
 }
@@ -3379,7 +3377,6 @@ fn emit_index_column_value_for_insert(
             })
             .collect();
         let saved = program.self_table_context.take();
-        super::expr::set_self_table_affinities(&columns);
         program.self_table_context = Some(SelfTableContext::Registers {
             column_regs,
             columns,
@@ -3387,7 +3384,6 @@ fn emit_index_column_value_for_insert(
 
         translate_expr(program, None, &expr, dest_reg, resolver)?;
 
-        super::expr::clear_self_table_affinities();
         program.self_table_context = saved;
 
         // Apply column affinity for VIRTUAL columns.

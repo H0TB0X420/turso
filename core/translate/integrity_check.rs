@@ -407,7 +407,6 @@ fn translate_integrity_check_impl(
                         // virtual column expressions stored in index columns.
                         let saved = program.self_table_context.take();
                         if let Some(jt) = table_references.joined_tables().first() {
-                            crate::translate::expr::set_self_table_affinities(jt.table.columns());
                             program.self_table_context =
                                 Some(crate::vdbe::builder::SelfTableContext::Query {
                                     table_ref_id: jt.internal_id,
@@ -422,7 +421,6 @@ fn translate_integrity_check_impl(
                             resolver,
                             NoConstantOptReason::RegisterReuse,
                         )?;
-                        crate::translate::expr::clear_self_table_affinities();
                         program.self_table_context = saved;
                     }
                 }

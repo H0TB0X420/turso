@@ -835,13 +835,11 @@ fn emit_index_column_value_from_cursor(
         let joined = table_references.joined_tables().first();
         if let Some(jt) = joined {
             let saved = program.self_table_context.take();
-            crate::translate::expr::set_self_table_affinities(jt.table.columns());
             program.self_table_context = Some(crate::vdbe::builder::SelfTableContext::Query {
                 table_ref_id: jt.internal_id,
                 referenced_tables: table_references.clone(),
             });
             translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
-            crate::translate::expr::clear_self_table_affinities();
             program.self_table_context = saved;
         } else {
             translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;

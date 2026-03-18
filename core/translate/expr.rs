@@ -111,11 +111,11 @@ fn translate_between_expr(
 }
 
 fn build_between_terms(
-    lhs: ast::Expr,
+    lhs: Expr,
     not: bool,
-    start: ast::Expr,
-    end: ast::Expr,
-) -> (ast::Expr, ast::Expr, ast::Operator) {
+    start: Expr,
+    end: Expr,
+) -> (Expr, Expr, ast::Operator) {
     let (lower_op, upper_op, combine_op) = if not {
         (
             ast::Operator::Less,
@@ -129,35 +129,9 @@ fn build_between_terms(
             ast::Operator::And,
         )
     };
-    let lower_expr = ast::Expr::Binary(Box::new(lhs.clone()), lower_op, Box::new(start));
-    let upper_expr = ast::Expr::Binary(Box::new(lhs), upper_op, Box::new(end));
+    let lower_expr = Expr::Binary(Box::new(lhs.clone()), lower_op, Box::new(start));
+    let upper_expr = Expr::Binary(Box::new(lhs), upper_op, Box::new(end));
     (lower_expr, upper_expr, combine_op)
-}
-
-thread_local! {
-    static RECURSION_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    /// Column affinities for SELF_TABLE columns, set during generated column evaluation.
-    /// Used by get_expr_affinity_info to determine affinity for Expr::Column { SELF_TABLE }.
-    static SELF_TABLE_AFFINITIES: std::cell::RefCell<Vec<Affinity>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Set the thread-local SELF_TABLE affinities from a slice of columns.
-pub(crate) fn set_self_table_affinities(columns: &[Column]) {
-    SELF_TABLE_AFFINITIES.with(|a| {
-        let mut v = a.borrow_mut();
-        v.clear();
-        v.extend(columns.iter().map(|c| c.affinity()));
-    });
-}
-
-/// Clear the thread-local SELF_TABLE affinities.
-pub(crate) fn clear_self_table_affinities() {
-    SELF_TABLE_AFFINITIES.with(|a| a.borrow_mut().clear());
-}
-
-/// Look up affinity for a SELF_TABLE column index.
-fn self_table_affinity(column: usize) -> Option<Affinity> {
-    SELF_TABLE_AFFINITIES.with(|a| a.borrow().get(column).copied())
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -3232,7 +3206,6 @@ pub fn translate_expr(
                                     table_ref_id: *table_ref_id,
                                     referenced_tables: referenced_tables.unwrap().clone(),
                                 });
-                                set_self_table_affinities(table.columns());
                                 translate_expr(
                                     program,
                                     referenced_tables,
@@ -3240,7 +3213,6 @@ pub fn translate_expr(
                                     target_register,
                                     resolver,
                                 )?;
-                                clear_self_table_affinities();
                                 program.self_table_context = saved;
                                 // Apply the VIRTUAL column's declared affinity to the
                                 // computed result. The expression may produce a different
@@ -6156,11 +6128,11 @@ pub(crate) fn get_expr_affinity_info(
 ) -> ExprAffinityInfo {
     match expr {
         ast::Expr::Column { table, column, .. } => {
-            if table.is_self_table() {
-                return self_table_affinity(*column)
-                    .map(ExprAffinityInfo::with_affinity)
-                    .unwrap_or_else(ExprAffinityInfo::no_affinity);
-            }
+            //TODO will this work?
+            // if table.is_self_table() {
+            //         .map(ExprAffinityInfo::with_affinity)
+            //         .unwrap_or_else(ExprAffinityInfo::no_affinity);
+            // }
             if let Some(tables) = referenced_tables {
                 if let Some((_, table_ref)) = tables.find_table_by_internal_id(*table) {
                     if let Some(col) = table_ref.get_column_at(*column) {

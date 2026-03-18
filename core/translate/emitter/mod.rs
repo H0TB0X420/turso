@@ -1,4 +1,3 @@
-use crate::Level;
 use crate::translate::collate::{get_expr_collation_ctx, CollationSeq};
 use crate::translate::emitter::delete::emit_program_for_delete;
 use crate::translate::emitter::select::emit_program_for_select;
@@ -12,7 +11,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
 use turso_macros::match_ignore_ascii_case;
 
-use super::expr::{clear_self_table_affinities, set_self_table_affinities, translate_expr};
+use super::expr::{translate_expr};
 use super::group_by::GroupByMetadata;
 use super::main_loop::{LeftJoinMetadata, LoopLabels};
 use super::order_by::SortMetadata;
@@ -41,7 +40,7 @@ use crate::vdbe::insn::{to_u16, InsertFlags};
 use crate::vdbe::{insn::Insn, BranchOffset, CursorID};
 use crate::{bail_parse_error, Database, DatabaseCatalog, LimboError, Result, RwLock, SymbolTable};
 use crate::{CaptureDataChangesExt, Connection};
-use tracing::{instrument};
+use tracing::instrument;
 use turso_parser::ast::{
     self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
 };
@@ -639,7 +638,7 @@ pub enum TransactionMode {
 
 /// Main entry point for emitting bytecode for a SQL query
 /// Takes a query plan and generates the corresponding bytecode program
-#[instrument(skip_all, level = Level::DEBUG)]
+#[instrument(skip_all, level = tracing::Level::DEBUG)]
 pub fn emit_program(
     connection: &Arc<Connection>,
     resolver: &Resolver,
@@ -1414,7 +1413,6 @@ pub(crate) fn emit_index_column_value_old_image(
         let joined = table_references.joined_tables().first();
         let self_table_context = program.self_table_context.take();
         if let Some(jt) = joined {
-            set_self_table_affinities(jt.table.columns());
             program.self_table_context = Some(SelfTableContext::Query {
                 table_ref_id: jt.internal_id,
                 referenced_tables: table_references.clone(),
@@ -1429,9 +1427,6 @@ pub(crate) fn emit_index_column_value_old_image(
             resolver,
             NoConstantOptReason::RegisterReuse,
         )?;
-        if joined.is_some() {
-            clear_self_table_affinities();
-        }
         program.self_table_context = self_table_context;
     } else {
         program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
@@ -1484,7 +1479,6 @@ fn emit_index_column_value_new_image(
                 columns_start_reg + i
             })
             .collect();
-        set_self_table_affinities(columns);
         program.self_table_context = Some(SelfTableContext::Registers {
             column_regs,
             columns: columns.to_vec(),
@@ -1497,7 +1491,6 @@ fn emit_index_column_value_new_image(
             resolver,
             NoConstantOptReason::RegisterReuse,
         )?;
-        clear_self_table_affinities();
         program.self_table_context = saved_ctx;
     } else {
         let col_in_table = columns

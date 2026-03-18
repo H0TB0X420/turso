@@ -419,9 +419,6 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                 if let Some(column) = build_table.columns().get(col_idx) {
                     match column.generated_type() {
                         GeneratedType::Virtual(expr) => {
-                            use crate::translate::expr::{
-                                clear_self_table_affinities, set_self_table_affinities,
-                            };
                             use crate::vdbe::builder::SelfTableContext;
 
                             let saved = planner.program.self_table_context.take();
@@ -429,7 +426,6 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                                 table_ref_id: build_table.internal_id,
                                 referenced_tables: planner.table_references.clone(),
                             });
-                            set_self_table_affinities(build_table.table.columns());
                             translate_expr(
                                 planner.program,
                                 Some(planner.table_references),
@@ -437,7 +433,6 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                                 payload_reg + i,
                                 &planner.t_ctx.resolver,
                             )?;
-                            clear_self_table_affinities();
                             planner.program.self_table_context = saved;
                             let affinity = column.affinity();
                             planner.program.emit_insn(Insn::Affinity {

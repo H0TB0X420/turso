@@ -2504,7 +2504,6 @@ pub(super) fn emit_generated_expr_from_registers(
         .collect();
 
     let saved_context = program.self_table_context.take();
-    crate::translate::expr::set_self_table_affinities(columns);
     program.self_table_context = Some(SelfTableContext::Registers {
         column_regs,
         columns: columns.to_vec(),
@@ -2512,7 +2511,6 @@ pub(super) fn emit_generated_expr_from_registers(
 
     translate_expr(program, None, &expr, target_reg, resolver)?;
 
-    crate::translate::expr::clear_self_table_affinities();
     program.self_table_context = saved_context;
     Ok(())
 }
@@ -2564,7 +2562,6 @@ pub(super) fn compute_virtual_columns_for_update(
                     let column_regs = old_registers.to_vec();
 
                     let saved_context = program.self_table_context.take();
-                    crate::translate::expr::set_self_table_affinities(columns);
                     program.self_table_context = Some(SelfTableContext::Registers {
                         column_regs,
                         columns: columns.to_vec(),
@@ -2573,7 +2570,6 @@ pub(super) fn compute_virtual_columns_for_update(
                     translate_expr(program, None, &expr, target_reg, resolver)?;
                     program.emit_column_affinity(target_reg, column.affinity());
 
-                    crate::translate::expr::clear_self_table_affinities();
                     program.self_table_context = saved_context;
                 }
             }
