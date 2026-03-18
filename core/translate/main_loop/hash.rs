@@ -422,10 +422,11 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                             use crate::vdbe::builder::SelfTableContext;
 
                             let saved = planner.program.self_table_context.take();
-                            planner.program.self_table_context = Some(SelfTableContext::ForSelect {
-                                table_ref_id: build_table.internal_id,
-                                referenced_tables: planner.table_references.clone(),
-                            });
+                            planner.program.self_table_context =
+                                Some(SelfTableContext::ForSelect {
+                                    table_ref_id: build_table.internal_id,
+                                    referenced_tables: planner.table_references.clone(),
+                                });
                             translate_expr(
                                 planner.program,
                                 Some(planner.table_references),

@@ -1467,20 +1467,11 @@ fn emit_index_column_value_new_image(
             is_strict,
         )?;
 
-        let column_regs: Vec<usize> = columns
-            .iter()
-            .enumerate()
-            .map(|(i, col)| {
-                if col.is_rowid_alias() { //TODO this pattern is used all over the place, see if we can extract it
-                    return rowid_reg;
-                }
-                columns_start_reg + i
-            })
-            .collect();
-        program.self_table_context = Some(SelfTableContext::ForDML {
-            column_regs,
-            columns: columns.to_vec(),
-        });
+        program.self_table_context = Some(SelfTableContext::for_contiguous_regs(
+            columns,
+            columns_start_reg,
+            Some(rowid_reg),
+        ));
 
         translate_expr_no_constant_opt(
             program,

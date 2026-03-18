@@ -122,6 +122,31 @@ pub enum SelfTableContext {
     },
 }
 
+impl SelfTableContext {
+    /// Build a ForDML context from contiguous registers starting at `base_reg`.
+    /// If provided, use `rowid_reg` for rowid columns.
+    pub fn for_contiguous_regs(
+        columns: &[Column],
+        base_reg: usize,
+        rowid_reg: Option<usize>,
+    ) -> Self {
+        Self::ForDML {
+            column_regs: columns
+                .iter()
+                .enumerate()
+                .map(|(i, col)| {
+                    if col.is_rowid_alias() {
+                        rowid_reg.unwrap_or(base_reg + i)
+                    } else {
+                        base_reg + i
+                    }
+                })
+                .collect(),
+            columns: columns.to_vec(),
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub struct ProgramBuilder {
     pub table_reference_counter: TableRefIdCounter,

@@ -619,7 +619,7 @@ fn emit_update_column_values<'a>(
             match table_column.generated_type() {
                 GeneratedType::Virtual(_) => {
                     //TODO this forces a copy pass for record compaction in mod.rs:747,
-                    // see if instead I can avoid the placeholder here.
+                    // see if instead we can avoid the placeholder here.
                     program.emit_null(target_reg, None);
                 }
                 GeneratedType::NotGenerated => {
@@ -1108,11 +1108,9 @@ fn emit_update_insns<'a>(
             // use the new rowid register; otherwise use the current rowid (beg).
             let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
 
-            // Compute VIRTUAL column values for trigger access
-            // VIRTUAL columns are normally NULL (computed on read), but triggers need actual values
             let column_lookup = crate::schema::build_column_name_lookup(columns);
 
-            // Compute VIRTUAL columns for NEW values (contiguous registers at 'start')
+            // Compute virtual columns for NEW values
             compute_virtual_columns_for_update(
                 program,
                 columns,
@@ -1124,7 +1122,7 @@ fn emit_update_insns<'a>(
                 &t_ctx.resolver,
             )?;
 
-            // Compute VIRTUAL columns for OLD values (non-contiguous registers in old_registers slice)
+            // Compute virtual columns for OLD values
             compute_virtual_columns_for_update(
                 program,
                 columns,
@@ -2489,25 +2487,12 @@ pub(super) fn emit_generated_expr_from_registers(
     resolver: &Resolver,
     rowid_reg: Option<usize>,
 ) -> Result<()> {
-    // Build column_regs from contiguous registers, with rowid alias override
-    let column_regs: Vec<usize> = columns
-        .iter()
-        .enumerate()
-        .map(|(i, col)| {
-            if col.is_rowid_alias() {
-                if let Some(r) = rowid_reg {
-                    return r;
-                }
-            }
-            registers_start + i
-        })
-        .collect();
-
     let saved_context = program.self_table_context.take();
-    program.self_table_context = Some(SelfTableContext::ForDML {
-        column_regs,
-        columns: columns.to_vec(),
-    });
+    program.self_table_context = Some(SelfTableContext::for_contiguous_regs(
+        columns,
+        registers_start,
+        rowid_reg,
+    ));
 
     translate_expr(program, None, &expr, target_reg, resolver)?;
 

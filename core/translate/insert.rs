@@ -2636,33 +2636,36 @@ fn translate_column<'a>(
 ///
 /// This function iterates through column mappings, finds VIRTUAL generated columns,
 /// evaluates their expressions, and applies column affinity for consistency.
+/// Build a [SelfTableContext::ForDML] from column mappings.
+/// Rowid alias columns use the rowid_alias register when provided.
+fn self_table_ctx_from_col_mappings<'a>(
+    col_mappings: &[ColMapping<'a>],
+    rowid_alias: Option<&ColMapping<'a>>,
+) -> SelfTableContext {
+    SelfTableContext::ForDML {
+        column_regs: col_mappings
+            .iter()
+            .map(|cm| {
+                if cm.column.is_rowid_alias() {
+                    if let Some(ra) = rowid_alias {
+                        return ra.register;
+                    }
+                }
+                cm.register
+            })
+            .collect(),
+        columns: col_mappings.iter().map(|cm| cm.column.clone()).collect(),
+    }
+}
+
 pub fn compute_virtual_columns_for_triggers<'a>(
     program: &mut ProgramBuilder,
     col_mappings: &[ColMapping<'a>],
     rowid_alias: Option<&ColMapping<'a>>,
     resolver: &Resolver,
 ) -> Result<()> {
-    // col_mappings is indexed by table column position.
-    // Build column_regs: for each table column index, the register holding its value.
-    // For rowid alias columns, use the rowid register from the separate mapping.
-    let column_regs: Vec<usize> = col_mappings
-        .iter()
-        .map(|cm| {
-            if cm.column.is_rowid_alias() {
-                if let Some(ra) = rowid_alias {
-                    return ra.register;
-                }
-            }
-            cm.register
-        })
-        .collect();
-    let columns: Vec<Column> = col_mappings.iter().map(|cm| cm.column.clone()).collect();
-
     let saved_context = program.self_table_context.take();
-    program.self_table_context = Some(SelfTableContext::ForDML {
-        column_regs,
-        columns,
-    });
+    program.self_table_context = Some(self_table_ctx_from_col_mappings(col_mappings, rowid_alias));
 
     for col_mapping in col_mappings {
         if let GeneratedType::Virtual(expr) = col_mapping.column.generated_type() {
@@ -3362,25 +3365,11 @@ fn emit_index_column_value_for_insert(
             .collect();
         schema::resolve_gencol_names(&mut expr, &columns)?;
 
-        // Set up SelfTableContext::Registers from col_mappings
-        let rowid_alias = insertion.rowid_alias_mapping();
-        let column_regs: Vec<usize> = insertion
-            .col_mappings
-            .iter()
-            .map(|cm| {
-                if cm.column.is_rowid_alias() {
-                    if let Some(ra) = rowid_alias {
-                        return ra.register;
-                    }
-                }
-                cm.register
-            })
-            .collect();
         let saved = program.self_table_context.take();
-        program.self_table_context = Some(SelfTableContext::ForDML {
-            column_regs,
-            columns,
-        });
+        program.self_table_context = Some(self_table_ctx_from_col_mappings(
+            &insertion.col_mappings,
+            insertion.rowid_alias_mapping(),
+        ));
 
         translate_expr(program, None, &expr, dest_reg, resolver)?;
 
