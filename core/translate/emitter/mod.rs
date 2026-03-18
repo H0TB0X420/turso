@@ -11,7 +11,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
 use turso_macros::match_ignore_ascii_case;
 
-use super::expr::translate_expr;
+use super::expr::{clear_self_table_affinities, set_self_table_affinities, translate_expr};
 use super::group_by::GroupByMetadata;
 use super::main_loop::{LeftJoinMetadata, LoopLabels};
 use super::order_by::SortMetadata;
@@ -23,9 +23,8 @@ use crate::schema::{
 };
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
-    bind_and_rewrite_expr, rewrite_between_expr, translate_expr_no_constant_opt, walk_expr,
-    walk_expr_mut,
-    BindingBehavior, NoConstantOptReason, WalkControl,
+    bind_and_rewrite_expr, translate_expr_no_constant_opt, walk_expr,
+    walk_expr_mut, BindingBehavior, NoConstantOptReason, WalkControl,
 };
 use crate::translate::plan::{JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn};
 use crate::translate::planner::TableMask;
@@ -36,12 +35,12 @@ use crate::util::{
     check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
 };
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::builder::{CursorType, ProgramBuilder};
+use crate::vdbe::builder::{CursorType, ProgramBuilder, SelfTableContext};
 use crate::vdbe::insn::{to_u16, InsertFlags};
 use crate::vdbe::{insn::Insn, BranchOffset, CursorID};
 use crate::{bail_parse_error, Database, DatabaseCatalog, LimboError, Result, RwLock, SymbolTable};
 use crate::{CaptureDataChangesExt, Connection};
-use tracing::{instrument, Level};
+use tracing::{instrument};
 use turso_parser::ast::{
     self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
 };
@@ -1380,8 +1379,7 @@ fn rewrite_where_for_update_registers(
             Expr::RowId { .. } => {
                 *e = Expr::Register(rowid_reg);
             }
-            // Skip pre-resolved SELF_TABLE column references — they're handled
-            // by SelfTableContext during translate_expr evaluation.
+            // self_table column references are handled by SelfTableContext translate_expr
             Expr::Column { table, .. } if table.is_self_table() => {
                 return Ok(WalkControl::SkipChildren);
             }
@@ -1410,17 +1408,17 @@ pub(crate) fn emit_index_column_value_old_image(
             resolver,
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
-        // Set up SelfTableContext for SELF_TABLE references in virtual column expressions.
-        let joined = table_references.joined_tables().first();
-        let saved = program.self_table_context.take();
+
+        let joined = table_references.joined_tables().first(); //TODO will this work if right_join_swapped is true?
+        let self_table_context = program.self_table_context.take();
         if let Some(jt) = joined {
-            crate::translate::expr::set_self_table_affinities(jt.table.columns());
-            program.self_table_context = Some(crate::vdbe::builder::SelfTableContext::Query {
+            set_self_table_affinities(jt.table.columns());
+            program.self_table_context = Some(SelfTableContext::Query {
                 table_ref_id: jt.internal_id,
                 referenced_tables: table_references.clone(),
             });
         }
-        rewrite_between_expr(&mut expr);
+
         translate_expr_no_constant_opt(
             program,
             Some(table_references),
@@ -1430,9 +1428,9 @@ pub(crate) fn emit_index_column_value_old_image(
             NoConstantOptReason::RegisterReuse,
         )?;
         if joined.is_some() {
-            crate::translate::expr::clear_self_table_affinities();
+            clear_self_table_affinities();
         }
-        program.self_table_context = saved;
+        program.self_table_context = self_table_context;
     } else {
         program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
     }
@@ -1484,12 +1482,11 @@ fn emit_index_column_value_new_image(
                 columns_start_reg + i
             })
             .collect();
-        crate::translate::expr::set_self_table_affinities(columns);
-        program.self_table_context = Some(crate::vdbe::builder::SelfTableContext::Registers {
+        set_self_table_affinities(columns);
+        program.self_table_context = Some(SelfTableContext::Registers {
             column_regs,
             columns: columns.to_vec(),
         });
-        rewrite_between_expr(&mut expr);
         translate_expr_no_constant_opt(
             program,
             None,
@@ -1498,7 +1495,7 @@ fn emit_index_column_value_new_image(
             resolver,
             NoConstantOptReason::RegisterReuse,
         )?;
-        crate::translate::expr::clear_self_table_affinities();
+        clear_self_table_affinities();
         program.self_table_context = saved_ctx;
     } else {
         let col_in_table = columns

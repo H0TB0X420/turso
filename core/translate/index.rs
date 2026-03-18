@@ -840,7 +840,6 @@ fn emit_index_column_value_from_cursor(
                 table_ref_id: jt.internal_id,
                 referenced_tables: table_references.clone(),
             });
-            crate::translate::expr::rewrite_between_expr(&mut expr);
             translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
             crate::translate::expr::clear_self_table_affinities();
             program.self_table_context = saved;

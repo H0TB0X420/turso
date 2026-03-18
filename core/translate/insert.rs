@@ -2667,8 +2667,7 @@ pub fn compute_virtual_columns_for_triggers<'a>(
 
     for col_mapping in col_mappings {
         if let GeneratedType::Virtual(expr) = col_mapping.column.generated_type() {
-            let mut expr = expr.as_ref().clone();
-            super::expr::rewrite_between_expr(&mut expr);
+            let expr = expr.as_ref().clone();
             translate_expr(program, None, &expr, col_mapping.register, resolver)?;
             program.emit_column_affinity(col_mapping.register, col_mapping.column.affinity());
         }
@@ -3363,8 +3362,7 @@ fn emit_index_column_value_for_insert(
             .iter()
             .map(|cm| cm.column.clone())
             .collect();
-        crate::schema::resolve_gencol_names(&mut expr, &columns)?;
-        super::expr::rewrite_between_expr(&mut expr);
+        schema::resolve_gencol_names(&mut expr, &columns)?;
 
         // Set up SelfTableContext::Registers from col_mappings
         let rowid_alias = insertion.rowid_alias_mapping();

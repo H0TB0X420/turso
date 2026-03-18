@@ -127,14 +127,20 @@ pub fn get_expr_collation_ctx(
                 return Ok(WalkControl::SkipChildren);
             }
             Expr::Column { table, column, .. } => {
-                let (_, table_ref) = referenced_tables
-                    .find_table_by_internal_id(*table)
-                    .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string()))?;
-                let column = table_ref
-                    .get_column_at(*column)
-                    .ok_or_else(|| crate::LimboError::ParseError("column not found".to_string()))?;
-                if maybe_column_collseq.is_none() {
-                    maybe_column_collseq = Some(column.collation());
+                // SELF_TABLE columns (from generated column expressions) aren't in
+                // referenced_tables — skip; the cache is best-effort.
+                if !table.is_self_table() {
+                    let (_, table_ref) = referenced_tables
+                        .find_table_by_internal_id(*table)
+                        .ok_or_else(|| {
+                            crate::LimboError::ParseError("table not found".to_string())
+                        })?;
+                    let column = table_ref.get_column_at(*column).ok_or_else(|| {
+                        crate::LimboError::ParseError("column not found".to_string())
+                    })?;
+                    if maybe_column_collseq.is_none() {
+                        maybe_column_collseq = Some(column.collation());
+                    }
                 }
             }
             _ => {}

@@ -9,7 +9,7 @@ use crate::schema::{BTreeTable, IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::{
     emit_check_constraints, emit_make_record_without_virtual_columns, UpdateRowSource,
 };
-use crate::translate::expr::{rewrite_between_expr, walk_expr, WalkControl};
+use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
     emit_fk_child_update_counters, emit_parent_key_change_checks, fire_fk_update_actions,
 };

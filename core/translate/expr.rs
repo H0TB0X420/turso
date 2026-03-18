@@ -134,33 +134,14 @@ fn build_between_terms(
     (lower_expr, upper_expr, combine_op)
 }
 
-/// Rewrite BETWEEN to Binary AND/OR for contexts where translate_between_expr
-/// can't be used (e.g., generated column evaluation without referenced_tables).
-pub fn rewrite_between_expr(expr: &mut ast::Expr) {
-    let _ = walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-        if let ast::Expr::Between {
-            lhs,
-            not,
-            start,
-            end,
-        } = e
-        {
-            let (lower, upper, combine_op) =
-                build_between_terms(std::mem::take(lhs), *not, std::mem::take(start), std::mem::take(end));
-            *e = ast::Expr::Binary(Box::new(lower), combine_op, Box::new(upper));
-        }
-        Ok(WalkControl::Continue)
-    });
-}
-
 /// RAII guard for virtual column recursion depth.
 ///
 /// Increments a thread-local depth counter on creation and decrements on drop,
 /// ensuring correct cleanup even when errors cause early returns.
-const MAX_VIRTUAL_COLUMN_DEPTH: u32 = 100;
+const MAX_RECURSION_DEPTH: u32 = 100;
 
 thread_local! {
-    static VIRTUAL_COL_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static RECURSION_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// Column affinities for SELF_TABLE columns, set during generated column evaluation.
     /// Used by get_expr_affinity_info to determine affinity for Expr::Column { SELF_TABLE }.
     static SELF_TABLE_AFFINITIES: std::cell::RefCell<Vec<Affinity>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -185,27 +166,26 @@ fn self_table_affinity(column: usize) -> Option<Affinity> {
     SELF_TABLE_AFFINITIES.with(|a| a.borrow().get(column).copied())
 }
 
-//TODO could this mechanism be generalized to expressions? Also, rename to RecursionGuare
-pub(crate) struct VirtualColumnRecursionGuard;
+pub(crate) struct RecursionGuard;
 
-impl VirtualColumnRecursionGuard {
+impl RecursionGuard {
     pub(crate) fn new() -> Result<Self> {
-        VIRTUAL_COL_DEPTH.with(|d| {
+        RECURSION_DEPTH.with(|d| {
             let cur = d.get();
-            if cur >= MAX_VIRTUAL_COLUMN_DEPTH {
+            if cur >= MAX_RECURSION_DEPTH {
                 crate::bail_parse_error!(
                     "virtual column evaluation exceeded maximum recursion depth"
                 );
             }
             d.set(cur + 1);
-            Ok(VirtualColumnRecursionGuard)
+            Ok(RecursionGuard)
         })
     }
 }
 
-impl Drop for VirtualColumnRecursionGuard {
+impl Drop for RecursionGuard {
     fn drop(&mut self) {
-        VIRTUAL_COL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        RECURSION_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
     }
 }
 
@@ -3075,11 +3055,10 @@ pub fn translate_expr(
                             None
                         }
                     });
-                    if let Some((mut gen_expr, affinity)) = is_virtual {
+                    if let Some((gen_expr, affinity)) = is_virtual {
                         // Restore context before recursive eval
                         program.self_table_context = ctx;
-                        let _guard = VirtualColumnRecursionGuard::new()?;
-                        rewrite_between_expr(&mut gen_expr);
+                        let _guard = RecursionGuard::new()?;
                         translate_expr(program, None, &gen_expr, target_register, resolver)?;
                         program.emit_insn(Insn::Affinity {
                             start_reg: target_register,
@@ -3284,9 +3263,8 @@ pub fn translate_expr(
                                     referenced_tables: referenced_tables.unwrap().clone(),
                                 });
                                 set_self_table_affinities(table.columns());
-                                let _guard = VirtualColumnRecursionGuard::new()?;
-                                let mut expr_rewritten = expr.as_ref().clone();
-                                rewrite_between_expr(&mut expr_rewritten);
+                                let _guard = RecursionGuard::new()?;
+                                let expr_rewritten = expr.as_ref().clone();
                                 translate_expr(
                                     program,
                                     referenced_tables,
