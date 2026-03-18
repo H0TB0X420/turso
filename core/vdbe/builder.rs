@@ -109,12 +109,12 @@ impl CursorKey {
 /// Set during generated column evaluation, `None` otherwise.
 pub enum SelfTableContext {
     /// SELECT path: remap SELF_TABLE to this real table reference.
-    Query {
+    ForSelect {
         table_ref_id: TableInternalId,
         referenced_tables: TableReferences,
     },
     /// INSERT/UPDATE path: column values live in registers.
-    Registers {
+    ForDML {
         /// column_index → register
         column_regs: Vec<usize>,
         /// Column metadata (needed to detect nested virtual columns)

@@ -2659,7 +2659,7 @@ pub fn compute_virtual_columns_for_triggers<'a>(
     let columns: Vec<Column> = col_mappings.iter().map(|cm| cm.column.clone()).collect();
 
     let saved_context = program.self_table_context.take();
-    program.self_table_context = Some(SelfTableContext::Registers {
+    program.self_table_context = Some(SelfTableContext::ForDML {
         column_regs,
         columns,
     });
@@ -3377,7 +3377,7 @@ fn emit_index_column_value_for_insert(
             })
             .collect();
         let saved = program.self_table_context.take();
-        program.self_table_context = Some(SelfTableContext::Registers {
+        program.self_table_context = Some(SelfTableContext::ForDML {
             column_regs,
             columns,
         });

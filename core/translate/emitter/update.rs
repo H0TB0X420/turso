@@ -2504,7 +2504,7 @@ pub(super) fn emit_generated_expr_from_registers(
         .collect();
 
     let saved_context = program.self_table_context.take();
-    program.self_table_context = Some(SelfTableContext::Registers {
+    program.self_table_context = Some(SelfTableContext::ForDML {
         column_regs,
         columns: columns.to_vec(),
     });
@@ -2562,7 +2562,7 @@ pub(super) fn compute_virtual_columns_for_update(
                     let column_regs = old_registers.to_vec();
 
                     let saved_context = program.self_table_context.take();
-                    program.self_table_context = Some(SelfTableContext::Registers {
+                    program.self_table_context = Some(SelfTableContext::ForDML {
                         column_regs,
                         columns: columns.to_vec(),
                     });

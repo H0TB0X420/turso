@@ -835,7 +835,7 @@ fn emit_index_column_value_from_cursor(
         let joined = table_references.joined_tables().first();
         if let Some(jt) = joined {
             let saved = program.self_table_context.take();
-            program.self_table_context = Some(crate::vdbe::builder::SelfTableContext::Query {
+            program.self_table_context = Some(crate::vdbe::builder::SelfTableContext::ForSelect {
                 table_ref_id: jt.internal_id,
                 referenced_tables: table_references.clone(),
             });

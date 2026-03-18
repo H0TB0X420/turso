@@ -2965,7 +2965,7 @@ pub fn translate_expr(
             // Take the context out to avoid borrow conflict with `program`.
             let ctx = program.self_table_context.take();
             match ctx {
-                Some(SelfTableContext::Query {
+                Some(SelfTableContext::ForSelect {
                     table_ref_id: real_id,
                     ref referenced_tables,
                 }) => {
@@ -2976,7 +2976,7 @@ pub fn translate_expr(
                         is_rowid_alias: *is_rowid_alias,
                     };
                     // Restore context before recursive call (nested virtual cols may need it)
-                    program.self_table_context = Some(SelfTableContext::Query {
+                    program.self_table_context = Some(SelfTableContext::ForSelect {
                         table_ref_id: real_id,
                         referenced_tables: referenced_tables.clone(),
                     });
@@ -2988,7 +2988,7 @@ pub fn translate_expr(
                         resolver,
                     );
                 }
-                Some(SelfTableContext::Registers {
+                Some(SelfTableContext::ForDML {
                     ref column_regs,
                     ref columns,
                 }) => {
@@ -3202,7 +3202,7 @@ pub fn translate_expr(
                                 // Set up SelfTableContext so that Expr::Column { SELF_TABLE }
                                 // in the generated expression remaps to the real table reference.
                                 let saved = program.self_table_context.take();
-                                program.self_table_context = Some(SelfTableContext::Query {
+                                program.self_table_context = Some(SelfTableContext::ForSelect {
                                     table_ref_id: *table_ref_id,
                                     referenced_tables: referenced_tables.unwrap().clone(),
                                 });

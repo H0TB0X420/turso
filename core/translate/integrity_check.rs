@@ -408,7 +408,7 @@ fn translate_integrity_check_impl(
                         let saved = program.self_table_context.take();
                         if let Some(jt) = table_references.joined_tables().first() {
                             program.self_table_context =
-                                Some(crate::vdbe::builder::SelfTableContext::Query {
+                                Some(crate::vdbe::builder::SelfTableContext::ForSelect {
                                     table_ref_id: jt.internal_id,
                                     referenced_tables: table_references.clone(),
                                 });

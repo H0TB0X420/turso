@@ -11,7 +11,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
 use turso_macros::match_ignore_ascii_case;
 
-use super::expr::{translate_expr};
+use super::expr::translate_expr;
 use super::group_by::GroupByMetadata;
 use super::main_loop::{LeftJoinMetadata, LoopLabels};
 use super::order_by::SortMetadata;
@@ -23,8 +23,8 @@ use crate::schema::{
 };
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
-    bind_and_rewrite_expr, translate_expr_no_constant_opt, walk_expr,
-    walk_expr_mut, BindingBehavior, NoConstantOptReason, WalkControl,
+    bind_and_rewrite_expr, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
+    BindingBehavior, NoConstantOptReason, WalkControl,
 };
 use crate::translate::plan::{JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn};
 use crate::translate::planner::TableMask;
@@ -1413,7 +1413,7 @@ pub(crate) fn emit_index_column_value_old_image(
         let joined = table_references.joined_tables().first();
         let self_table_context = program.self_table_context.take();
         if let Some(jt) = joined {
-            program.self_table_context = Some(SelfTableContext::Query {
+            program.self_table_context = Some(SelfTableContext::ForSelect {
                 table_ref_id: jt.internal_id,
                 referenced_tables: table_references.clone(),
             });
@@ -1466,32 +1466,37 @@ fn emit_index_column_value_new_image(
             Some(rowid_reg),
             is_strict,
         )?;
-        // Set up SelfTableContext for any SELF_TABLE refs in the expression
-        // (e.g., index on a virtual column whose expression references other columns).
-        let saved_ctx = program.self_table_context.take();
-        let column_regs: Vec<usize> = columns
-            .iter()
-            .enumerate()
-            .map(|(i, col)| {
-                if col.is_rowid_alias() {
-                    return rowid_reg;
-                }
-                columns_start_reg + i
-            })
-            .collect();
-        program.self_table_context = Some(SelfTableContext::Registers {
-            column_regs,
-            columns: columns.to_vec(),
-        });
-        translate_expr_no_constant_opt(
-            program,
-            None,
-            &expr,
-            dest_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
-        program.self_table_context = saved_ctx;
+
+        {
+            // Set up SelfTableContext for any SELF_TABLE refs in the expression
+            // (e.g., index on a virtual column whose expression references other columns).
+            let saved_ctx = program.self_table_context.take();
+            let column_regs: Vec<usize> = columns
+                .iter()
+                .enumerate()
+                .map(|(i, col)| {
+                    if col.is_rowid_alias() {
+                        return rowid_reg;
+                    }
+                    columns_start_reg + i
+                })
+                .collect();
+            program.self_table_context = Some(SelfTableContext::ForDML {
+                column_regs,
+                columns: columns.to_vec(),
+            });
+
+            translate_expr_no_constant_opt(
+                program,
+                None,
+                &expr,
+                dest_reg,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
+
+            program.self_table_context = saved_ctx;
+        }
     } else {
         let col_in_table = columns
             .get(idx_col.pos_in_table)
