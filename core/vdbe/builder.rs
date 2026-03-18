@@ -6,7 +6,7 @@ use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 use crate::{
     index_method::IndexMethodAttachment,
     parameters::Parameters,
-    schema::{BTreeTable, Index, PseudoCursorType, Schema, Table, Trigger},
+    schema::{BTreeTable, Column, Index, PseudoCursorType, Schema, Table, Trigger},
     translate::{
         collate::CollationSeq,
         emitter::{MaterializedColumnRef, TransactionMode},
@@ -105,6 +105,23 @@ impl CursorKey {
     }
 }
 
+/// Context for resolving `Expr::Column` with `TableInternalId::SELF_TABLE`.
+/// Set during generated column evaluation, `None` otherwise.
+pub enum SelfTableContext {
+    /// SELECT path: remap SELF_TABLE to this real table reference.
+    Query {
+        table_ref_id: TableInternalId,
+        referenced_tables: TableReferences,
+    },
+    /// INSERT/UPDATE path: column values live in registers.
+    Registers {
+        /// column_index → register
+        column_regs: Vec<usize>,
+        /// Column metadata (needed to detect nested virtual columns)
+        columns: Vec<Column>,
+    },
+}
+
 #[allow(dead_code)]
 pub struct ProgramBuilder {
     pub table_reference_counter: TableRefIdCounter,
@@ -198,6 +215,9 @@ pub struct ProgramBuilder {
     /// Maps table internal_id to result_columns_start_reg for FROM clause subqueries.
     /// Used when nested subqueries need to reference columns from outer query subqueries.
     subquery_result_regs: HashMap<TableInternalId, usize>,
+    /// Context for resolving Expr::Column with TableInternalId::SELF_TABLE.
+    /// Set during generated column evaluation, None otherwise.
+    pub self_table_context: Option<SelfTableContext>,
     /// Counter for CTE identity tracking. Each CTE definition gets a unique ID
     /// so that multiple references to the same CTE can share materialized data.
     next_cte_id: usize,
@@ -454,6 +474,7 @@ impl ProgramBuilder {
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: HashSet::default(),
             subquery_result_regs: HashMap::default(),
+            self_table_context: None,
             next_cte_id: 0,
             materialized_ctes: HashMap::default(),
             cte_reference_counts: HashMap::default(),

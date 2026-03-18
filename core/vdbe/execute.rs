@@ -11765,6 +11765,15 @@ pub fn op_add_column(
 
         let btree = Arc::make_mut(btree);
         btree.columns.push((**column).clone());
+        // Pre-resolve generated column names for the newly added column
+        if btree.columns.last().unwrap().is_virtual_generated() {
+            let last_idx = btree.columns.len() - 1;
+            if let Some(mut expr) = btree.columns[last_idx].generated_expr_cloned() {
+                if let Ok(()) = crate::schema::resolve_gencol_names(&mut expr, &btree.columns) {
+                    *btree.columns[last_idx].generated_expr_mut().unwrap() = expr;
+                }
+            }
+        }
         // Update CHECK constraints to include any constraints from the new column
         btree.check_constraints.clone_from(check_constraints);
     });

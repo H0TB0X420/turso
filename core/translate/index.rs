@@ -570,9 +570,7 @@ pub fn resolve_sorted_columns(
             // Also store the column's affinity so it can be applied during index population
             // (INTEGER→REAL conversions, etc., per SQLite's affinity rules).
             let (expr, affinity) = match column.generated_type() {
-                GeneratedType::Virtual(expr) => {
-                    (Some(expr.clone()), Some(column.affinity()))
-                }
+                GeneratedType::Virtual(expr) => (Some(expr.clone()), Some(column.affinity())),
                 GeneratedType::NotGenerated => (None, None),
             };
             resolved.push(IndexColumn {
@@ -774,15 +772,15 @@ fn is_deterministic_datetime_index_call(func: &Func, args: &[Box<Expr>]) -> bool
             !args.is_empty()
                 && !is_current_time_expr(args[0].as_ref())
                 && !args[1..]
-                .iter()
-                .any(|arg| is_unsafe_datetime_modifier(arg.as_ref()))
+                    .iter()
+                    .any(|arg| is_unsafe_datetime_modifier(arg.as_ref()))
         }
         Func::Scalar(ScalarFunc::StrfTime) => {
             args.len() >= 2
                 && !is_current_time_expr(args[1].as_ref())
                 && !args[2..]
-                .iter()
-                .any(|arg| is_unsafe_datetime_modifier(arg.as_ref()))
+                    .iter()
+                    .any(|arg| is_unsafe_datetime_modifier(arg.as_ref()))
         }
         Func::Scalar(ScalarFunc::TimeDiff) => {
             !args.iter().any(|arg| is_current_time_expr(arg.as_ref()))
@@ -832,7 +830,23 @@ fn emit_index_column_value_from_cursor(
             resolver,
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
-        translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
+        // Set up SelfTableContext for any SELF_TABLE references in the expression
+        // (virtual column expressions pre-resolved at schema time).
+        let joined = table_references.joined_tables().first();
+        if let Some(jt) = joined {
+            let saved = program.self_table_context.take();
+            crate::translate::expr::set_self_table_affinities(jt.table.columns());
+            program.self_table_context = Some(crate::vdbe::builder::SelfTableContext::Query {
+                table_ref_id: jt.internal_id,
+                referenced_tables: table_references.clone(),
+            });
+            crate::translate::expr::rewrite_between_expr(&mut expr);
+            translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
+            crate::translate::expr::clear_self_table_affinities();
+            program.self_table_context = saved;
+        } else {
+            translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
+        }
         // Apply column affinity for VIRTUAL columns. This ensures INTEGER→REAL
         // conversions (and other affinity rules) happen per SQLite's documentation.
         if let Some(affinity) = &idx_col.affinity {

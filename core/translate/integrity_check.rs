@@ -403,14 +403,29 @@ fn translate_integrity_check_impl(
                         program.emit_column_or_rowid(table_cursor_id, *pos, target);
                     }
                     BoundIndexColumn::Expr(expr) => {
+                        // Set up SelfTableContext for SELF_TABLE references in
+                        // virtual column expressions stored in index columns.
+                        let saved = program.self_table_context.take();
+                        if let Some(jt) = table_references.joined_tables().first() {
+                            crate::translate::expr::set_self_table_affinities(jt.table.columns());
+                            program.self_table_context =
+                                Some(crate::vdbe::builder::SelfTableContext::Query {
+                                    table_ref_id: jt.internal_id,
+                                    referenced_tables: table_references.clone(),
+                                });
+                        }
+                        let mut expr = expr.clone();
+                        crate::translate::expr::rewrite_between_expr(&mut expr);
                         translate_expr_no_constant_opt(
                             program,
                             Some(&table_references),
-                            expr,
+                            &expr,
                             target,
                             resolver,
                             NoConstantOptReason::RegisterReuse,
                         )?;
+                        crate::translate::expr::clear_self_table_affinities();
+                        program.self_table_context = saved;
                     }
                 }
             }

@@ -18,8 +18,7 @@ use crate::{
             bind_and_rewrite_expr, emit_returning_results, emit_returning_scan_back,
             process_returning_clause, restore_returning_row_image_in_cache,
             seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
-            translate_expr_with_context, walk_expr_mut, BindingBehavior, ExprContext,
-            NoConstantOptReason, ReturningBufferCtx, WalkControl,
+            walk_expr_mut, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
         },
         fkeys::{
             build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
@@ -49,7 +48,7 @@ use crate::{
     util::normalize_ident,
     vdbe::{
         affinity::Affinity,
-        builder::{CursorKey, CursorType, ProgramBuilder, ProgramBuilderOpts},
+        builder::{CursorKey, CursorType, ProgramBuilder, ProgramBuilderOpts, SelfTableContext},
         insn::{to_u16, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
         BranchOffset,
     },
@@ -2643,40 +2642,40 @@ pub fn compute_virtual_columns_for_triggers<'a>(
     rowid_alias: Option<&ColMapping<'a>>,
     resolver: &Resolver,
 ) -> Result<()> {
+    // col_mappings is indexed by table column position.
+    // Build column_regs: for each table column index, the register holding its value.
+    // For rowid alias columns, use the rowid register from the separate mapping.
+    let column_regs: Vec<usize> = col_mappings
+        .iter()
+        .map(|cm| {
+            if cm.column.is_rowid_alias() {
+                if let Some(ra) = rowid_alias {
+                    return ra.register;
+                }
+            }
+            cm.register
+        })
+        .collect();
+    let columns: Vec<Column> = col_mappings.iter().map(|cm| cm.column.clone()).collect();
+
+    let saved_context = program.self_table_context.take();
+    super::expr::set_self_table_affinities(&columns);
+    program.self_table_context = Some(SelfTableContext::Registers {
+        column_regs,
+        columns,
+    });
+
     for col_mapping in col_mappings {
         if let GeneratedType::Virtual(expr) = col_mapping.column.generated_type() {
-            translate_generated_expr(
-                program,
-                expr,
-                col_mapping.register,
-                col_mappings,
-                rowid_alias,
-                resolver,
-            )?;
+            let mut expr = expr.as_ref().clone();
+            super::expr::rewrite_between_expr(&mut expr);
+            translate_expr(program, None, &expr, col_mapping.register, resolver)?;
             program.emit_column_affinity(col_mapping.register, col_mapping.column.affinity());
         }
     }
-    Ok(())
-}
 
-/// Translate a generated column expression during INSERT.
-/// Handles Expr::Id column references by looking up their registers in col_mappings.
-fn translate_generated_expr<'a>(
-    program: &mut ProgramBuilder,
-    expr: &Box<Expr>,
-    target_register: usize,
-    col_mappings: &[ColMapping<'a>],
-    rowid_alias: Option<&ColMapping<'a>>,
-    resolver: &Resolver,
-) -> Result<()> {
-    use super::expr::{translate_expr_with_context, ExprContext};
-
-    // Use the unified evaluator with InsertGenerated context
-    let context = ExprContext::InsertGenerated {
-        col_mappings,
-        rowid_alias,
-    };
-    translate_expr_with_context(program, &context, expr, target_register, resolver)?;
+    super::expr::clear_self_table_affinities();
+    program.self_table_context = saved_context;
     Ok(())
 }
 
@@ -3356,17 +3355,44 @@ fn emit_index_column_value_for_insert(
     dest_reg: usize,
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
-        // Use InsertGenerated context which handles VIRTUAL column recursion.
-        // This properly evaluates VIRTUAL column expressions instead of just
-        // reading from registers (which would have NULL for VIRTUAL columns).
+        // Resolve any Expr::Id column references to Expr::Column { SELF_TABLE }
+        // so translate_expr can handle them via SelfTableContext::Registers.
+        let mut expr = expr.as_ref().clone();
+        let columns: Vec<Column> = insertion
+            .col_mappings
+            .iter()
+            .map(|cm| cm.column.clone())
+            .collect();
+        crate::schema::resolve_gencol_names(&mut expr, &columns)?;
+        super::expr::rewrite_between_expr(&mut expr);
+
+        // Set up SelfTableContext::Registers from col_mappings
         let rowid_alias = insertion.rowid_alias_mapping();
-        let context = ExprContext::InsertGenerated {
-            col_mappings: &insertion.col_mappings,
-            rowid_alias,
-        };
-        translate_expr_with_context(program, &context, expr, dest_reg, resolver)?;
-        // Apply column affinity for VIRTUAL columns. This ensures INTEGER->REAL
-        // conversions (and other affinity rules) happen per SQLite's documentation.
+        let column_regs: Vec<usize> = insertion
+            .col_mappings
+            .iter()
+            .map(|cm| {
+                if cm.column.is_rowid_alias() {
+                    if let Some(ra) = rowid_alias {
+                        return ra.register;
+                    }
+                }
+                cm.register
+            })
+            .collect();
+        let saved = program.self_table_context.take();
+        super::expr::set_self_table_affinities(&columns);
+        program.self_table_context = Some(SelfTableContext::Registers {
+            column_regs,
+            columns,
+        });
+
+        translate_expr(program, None, &expr, dest_reg, resolver)?;
+
+        super::expr::clear_self_table_affinities();
+        program.self_table_context = saved;
+
+        // Apply column affinity for VIRTUAL columns.
         if let Some(affinity) = &idx_col.affinity {
             program.emit_column_affinity(dest_reg, *affinity);
         }

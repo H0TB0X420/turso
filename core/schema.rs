@@ -5,7 +5,9 @@ use crate::return_if_io;
 use crate::stats::AnalyzeStats;
 use crate::sync::RwLock;
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
+use crate::translate::expr::{
+    bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
+};
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
 use crate::types::IOResult;
@@ -142,7 +144,7 @@ use std::ops::Deref;
 use tracing::trace;
 use turso_parser::ast::{
     self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, RefAct, ResolveType, SortOrder,
-    TypeOperator,
+    TableInternalId, TypeOperator,
 };
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
@@ -2472,6 +2474,12 @@ impl FromClauseSubquery {
 /// Extract all column name references from an expression as a set.
 /// Uses `walk_expr` to cover all expression types automatically.
 pub fn collect_column_refs(expr: &ast::Expr) -> HashSet<String> {
+    collect_column_refs_with_columns(expr, &[])
+}
+
+/// Extract all column name references from an expression as a set.
+/// `columns` is used to resolve pre-resolved `Expr::Column { SELF_TABLE }` back to names.
+pub fn collect_column_refs_with_columns(expr: &ast::Expr, columns: &[Column]) -> HashSet<String> {
     let mut refs = HashSet::default();
     let _ = walk_expr(expr, &mut |e| match e {
         ast::Expr::Id(name) | ast::Expr::Name(name) => {
@@ -2480,6 +2488,14 @@ pub fn collect_column_refs(expr: &ast::Expr) -> HashSet<String> {
         }
         ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col) => {
             refs.insert(normalize_ident(col.as_str()));
+            Ok(WalkControl::Continue)
+        }
+        ast::Expr::Column { table, column, .. } if table.is_self_table() => {
+            if let Some(col) = columns.get(*column) {
+                if let Some(name) = &col.name {
+                    refs.insert(normalize_ident(name));
+                }
+            }
             Ok(WalkControl::Continue)
         }
         ast::Expr::Subquery(_)
@@ -2524,7 +2540,7 @@ where
     let GeneratedType::Virtual(ref expr) = columns[start_idx].generated_type else {
         return false;
     };
-    for ref_name in collect_column_refs(expr) {
+    for ref_name in collect_column_refs_with_columns(expr, columns) {
         let Some(&dep_idx) = column_lookup.get(&ref_name.to_lowercase()) else {
             continue;
         };
@@ -2582,6 +2598,37 @@ fn has_transitive_dependency(
     }
 
     false
+}
+
+/// Resolve `Expr::Id` / `Expr::Qualified` in a generated column expression to
+/// `Expr::Column { table: SELF_TABLE, column: idx }`. This mirrors SQLite's approach
+/// of resolving column names once at schema-load time rather than at every codegen.
+pub fn resolve_gencol_names(expr: &mut Expr, columns: &[Column]) -> Result<()> {
+    walk_expr_mut(expr, &mut |e| match e {
+        Expr::Id(name) | Expr::Qualified(_, name) => {
+            let col_name = normalize_ident(name.as_str());
+            let (idx, col) = columns
+                .iter()
+                .enumerate()
+                .find(|(_, c)| {
+                    c.name
+                        .as_ref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(&col_name))
+                })
+                .ok_or_else(|| {
+                    crate::LimboError::ParseError(format!("no such column: {col_name}"))
+                })?;
+            *e = Expr::Column {
+                database: None,
+                table: TableInternalId::SELF_TABLE,
+                column: idx,
+                is_rowid_alias: col.is_rowid_alias(),
+            };
+            Ok(WalkControl::Continue)
+        }
+        _ => Ok(WalkControl::Continue),
+    })?;
+    Ok(())
 }
 
 fn resolve_generated_expr_function(
@@ -3244,6 +3291,16 @@ pub fn create_table(
             if let Some(u) = unique_set_w_only_rowid_alias {
                 unique_sets.remove(u);
             }
+        }
+    }
+
+    // Pre-resolve generated column names to Expr::Column { table: SELF_TABLE, ... }
+    for i in 0..cols.len() {
+        if cols[i].is_virtual_generated() {
+            // Safety: we split the borrow — take the expr out, resolve against all cols, put it back.
+            let mut expr = cols[i].generated_expr_cloned().unwrap();
+            resolve_gencol_names(&mut expr, &cols)?;
+            *cols[i].generated_expr_mut().unwrap() = expr;
         }
     }
 

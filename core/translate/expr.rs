@@ -1,8 +1,6 @@
 use crate::error::{SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR};
 use crate::translate::optimizer::constraints::ConstraintOperator;
 use crate::turso_assert;
-use rustc_hash::FxHashMap as HashMap;
-
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, UnaryOperator};
 
@@ -25,7 +23,7 @@ use crate::translate::plan::{Operation, ResultSetColumn, Search};
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::builder::CursorKey;
+use crate::vdbe::builder::{CursorKey, SelfTableContext};
 use crate::vdbe::{
     builder::ProgramBuilder,
     insn::{CmpInsFlags, InsertFlags, Insn},
@@ -134,80 +132,25 @@ fn build_between_terms(
     let lower_expr = ast::Expr::Binary(Box::new(lhs.clone()), lower_op, Box::new(start));
     let upper_expr = ast::Expr::Binary(Box::new(lhs), upper_op, Box::new(end));
     (lower_expr, upper_expr, combine_op)
-// =============================================================================
-// ExprContext: Unified context for expression evaluation across all paths
-// =============================================================================
-//
-// This enum unifies 4 previously separate expression evaluators:
-// - translate_expr (Query context)
-// - translate_virtual_column_expr (VirtualColumn context)
-// - translate_generated_expr_inner (InsertGenerated context)
-// - emit_generated_expr_recursive (UpdateGenerated context)
-//
-// Each variant captures the context-specific data needed for column resolution.
-
-/// Source for reading non-virtual columns in OLD context.
-#[allow(dead_code)]
-pub enum OldColumnSource<'a> {
-    /// Read from the table cursor (for expression index old-image computation).
-    Cursor(usize),
-    /// Copy from pre-loaded OLD registers (for UPDATE trigger OLD context).
-    Registers(&'a [usize]),
 }
 
-/// Context for expression evaluation across different code paths.
-///
-/// Different SQL operations (SELECT, INSERT, UPDATE) require different
-/// strategies for resolving column references. This enum captures the
-/// context-specific data needed for each case.
-#[allow(dead_code)] // Query variant is part of the API but callers use translate_expr directly
-pub enum ExprContext<'a> {
-    /// Standard query context - columns resolved from table cursors.
-    /// Used for SELECT, WHERE, ORDER BY, etc.
-    Query {
-        referenced_tables: Option<&'a TableReferences>,
-    },
-
-    /// INSERT context - columns resolved from prepared registers via ColMapping.
-    /// Used for evaluating generated column expressions during INSERT.
-    ///
-    /// `rowid_alias` is separate because INTEGER PRIMARY KEY columns need special
-    /// handling during INSERT - they may be auto-generated if NULL. The rowid alias
-    /// is never a virtual generated column, so it's not searched in `get_virtual_expr`.
-    InsertGenerated {
-        col_mappings: &'a [super::insert::ColMapping<'a>],
-        rowid_alias: Option<&'a super::insert::ColMapping<'a>>,
-    },
-
-    /// UPDATE context - columns resolved via HashMap lookup + register offset.
-    /// Used for evaluating generated columns during UPDATE and expression
-    /// index keys for the new image during UPDATE.
-    UpdateGenerated {
-        registers_start: usize,
-        column_lookup: &'a HashMap<String, usize>,
-        columns: &'a [Column],
-        /// Optional separate rowid register for rowid alias (INTEGER PRIMARY KEY) columns.
-        /// When `Some`, rowid alias columns are read from this register instead of
-        /// `registers_start + col_idx`. Used when building index keys for UPDATE new image.
-        rowid_reg: Option<usize>,
-    },
-
-    /// Virtual column context in SELECT - column expressions resolved from table schema.
-    /// Used when evaluating VIRTUAL generated columns within queries.
-    VirtualColumn {
-        table: &'a Table,
-        table_ref_id: ast::TableInternalId,
-        referenced_tables: Option<&'a TableReferences>,
-    },
-
-    /// OLD context for UPDATE - VIRTUAL columns are recursively evaluated,
-    /// regular columns are read from either the table cursor or pre-loaded registers.
-    /// Used for expression index keys (Cursor source) and trigger OLD context (Registers source).
-    OldGenerated {
-        source: OldColumnSource<'a>,
-        columns: &'a [Column],
-        column_lookup: &'a HashMap<String, usize>,
-    },
+/// Rewrite BETWEEN to Binary AND/OR for contexts where translate_between_expr
+/// can't be used (e.g., generated column evaluation without referenced_tables).
+pub fn rewrite_between_expr(expr: &mut ast::Expr) {
+    let _ = walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::Between {
+            lhs,
+            not,
+            start,
+            end,
+        } = e
+        {
+            let (lower, upper, combine_op) =
+                build_between_terms(std::mem::take(lhs), *not, std::mem::take(start), std::mem::take(end));
+            *e = ast::Expr::Binary(Box::new(lower), combine_op, Box::new(upper));
+        }
+        Ok(WalkControl::Continue)
+    });
 }
 
 /// RAII guard for virtual column recursion depth.
@@ -218,13 +161,35 @@ const MAX_VIRTUAL_COLUMN_DEPTH: u32 = 100;
 
 thread_local! {
     static VIRTUAL_COL_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Column affinities for SELF_TABLE columns, set during generated column evaluation.
+    /// Used by get_expr_affinity_info to determine affinity for Expr::Column { SELF_TABLE }.
+    static SELF_TABLE_AFFINITIES: std::cell::RefCell<Vec<Affinity>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Set the thread-local SELF_TABLE affinities from a slice of columns.
+pub(crate) fn set_self_table_affinities(columns: &[Column]) {
+    SELF_TABLE_AFFINITIES.with(|a| {
+        let mut v = a.borrow_mut();
+        v.clear();
+        v.extend(columns.iter().map(|c| c.affinity()));
+    });
+}
+
+/// Clear the thread-local SELF_TABLE affinities.
+pub(crate) fn clear_self_table_affinities() {
+    SELF_TABLE_AFFINITIES.with(|a| a.borrow_mut().clear());
+}
+
+/// Look up affinity for a SELF_TABLE column index.
+fn self_table_affinity(column: usize) -> Option<Affinity> {
+    SELF_TABLE_AFFINITIES.with(|a| a.borrow().get(column).copied())
 }
 
 //TODO could this mechanism be generalized to expressions? Also, rename to RecursionGuare
-struct VirtualColumnRecursionGuard;
+pub(crate) struct VirtualColumnRecursionGuard;
 
 impl VirtualColumnRecursionGuard {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         VIRTUAL_COL_DEPTH.with(|d| {
             let cur = d.get();
             if cur >= MAX_VIRTUAL_COLUMN_DEPTH {
@@ -242,1252 +207,6 @@ impl Drop for VirtualColumnRecursionGuard {
     fn drop(&mut self) {
         VIRTUAL_COL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
     }
-}
-
-impl<'a> ExprContext<'a> {
-    /// Emit code to evaluate a virtual column's expression and apply affinity.
-    ///
-    /// Virtual columns don't store their values - they compute them on demand.
-    /// This helper recursively translates the virtual column's generating expression,
-    /// then applies the column's declared affinity to ensure type consistency.
-    ///
-    /// A thread-local depth counter guards against unbounded recursion if a cycle
-    /// somehow slips past schema validation.
-    pub(crate) fn emit_virtual_column(
-        &self,
-        program: &mut ProgramBuilder,
-        expr: &Box<Expr>,
-        affinity: &Affinity,
-        target_reg: usize,
-        resolver: &Resolver,
-    ) -> Result<()> {
-        let _guard = VirtualColumnRecursionGuard::new()?;
-
-        translate_expr_with_context(program, self, expr, target_reg, resolver)?;
-        program.emit_insn(Insn::Affinity {
-            start_reg: target_reg,
-            count: std::num::NonZeroUsize::MIN, // 1 register
-            affinities: affinity.aff_mask().to_string(),
-        });
-
-        Ok(())
-    }
-
-    /// Resolve a column by name and emit code to load its value into target_reg.
-    ///
-    /// Each context resolves columns differently:
-    /// - Query: Errors (planner converts Expr::Id to Expr::Column before translation)
-    /// - InsertGenerated: Searches col_mappings, copies from pre-loaded register
-    /// - UpdateGenerated: HashMap lookup, copies from registers_start + offset
-    /// - VirtualColumn: Table schema lookup, creates Expr::Column and translates it
-    pub fn resolve_column_by_name(
-        &self,
-        program: &mut ProgramBuilder,
-        name: &str,
-        target_reg: usize,
-        resolver: &Resolver,
-    ) -> Result<()> {
-        let col_name = crate::util::normalize_ident(name);
-
-        match self {
-            ExprContext::Query { .. } => {
-                // Query context doesn't resolve Expr::Id - the planner converts
-                // identifiers to Expr::Column before translation
-                crate::bail_parse_error!("cannot resolve identifier '{}' in query context", name)
-            }
-
-            ExprContext::InsertGenerated {
-                col_mappings,
-                rowid_alias,
-            } => {
-                // First check rowid_alias (INTEGER PRIMARY KEY), then col_mappings
-                let mapping = rowid_alias
-                    .filter(|m| {
-                        m.column
-                            .name
-                            .as_ref()
-                            .is_some_and(|n| n.eq_ignore_ascii_case(&col_name))
-                    })
-                    .or_else(|| {
-                        col_mappings.iter().find(|m| {
-                            m.column
-                                .name
-                                .as_ref()
-                                .is_some_and(|n| n.eq_ignore_ascii_case(&col_name))
-                        })
-                    });
-
-                if let Some(mapping) = mapping {
-                    match mapping.column.generated_type() {
-                        GeneratedType::Virtual(expr) => {
-                            let affinity = mapping.column.affinity();
-                            self.emit_virtual_column(
-                                program, expr, &affinity, target_reg, resolver,
-                            )?;
-                        }
-                        GeneratedType::NotGenerated => {
-                            program.emit_insn(Insn::Copy {
-                                src_reg: mapping.register,
-                                dst_reg: target_reg,
-                                extra_amount: 0,
-                            });
-                        }
-                    }
-                    Ok(())
-                } else {
-                    crate::bail_parse_error!("unknown column: {}", name)
-                }
-            }
-
-            ExprContext::UpdateGenerated {
-                registers_start,
-                column_lookup,
-                columns,
-                rowid_reg,
-            } => self.resolve_generated_column(
-                program,
-                &col_name,
-                name,
-                column_lookup,
-                columns,
-                target_reg,
-                resolver,
-                |program, col_idx, col| {
-                    // Check if this is a rowid alias column with a separate rowid register
-                    if let Some(rowid_r) = rowid_reg {
-                        if col.is_rowid_alias() {
-                            program.emit_insn(Insn::Copy {
-                                src_reg: *rowid_r,
-                                dst_reg: target_reg,
-                                extra_amount: 0,
-                            });
-                            return Ok(());
-                        }
-                    }
-                    // Regular column - copy from calculated register offset
-                    let src_reg = registers_start + col_idx;
-                    program.emit_insn(Insn::Copy {
-                        src_reg,
-                        dst_reg: target_reg,
-                        extra_amount: 0,
-                    });
-                    Ok(())
-                },
-            ),
-
-            ExprContext::VirtualColumn {
-                table,
-                table_ref_id,
-                referenced_tables,
-            } => {
-                // Look up the column in the table schema
-                if let Some((col_idx, col)) = table.get_column_by_name(&col_name) {
-                    // Create a proper Column expression and translate it via translate_expr
-                    // This handles nested virtual columns correctly via the standard path
-                    let col_expr = ast::Expr::Column {
-                        database: None,
-                        table: *table_ref_id,
-                        column: col_idx,
-                        is_rowid_alias: col.is_rowid_alias(),
-                    };
-                    translate_expr(program, *referenced_tables, &col_expr, target_reg, resolver)?;
-                    Ok(())
-                } else {
-                    crate::bail_parse_error!(
-                        "column \"{}\" not found in generated expression",
-                        col_name
-                    )
-                }
-            }
-
-            ExprContext::OldGenerated {
-                source,
-                columns,
-                column_lookup,
-            } => self.resolve_generated_column(
-                program,
-                &col_name,
-                name,
-                column_lookup,
-                columns,
-                target_reg,
-                resolver,
-                |program, col_idx, _col| {
-                    // Non-virtual column: read from appropriate source
-                    match source {
-                        OldColumnSource::Cursor(cursor_id) => {
-                            program.emit_column_or_rowid(*cursor_id, col_idx, target_reg);
-                        }
-                        OldColumnSource::Registers(old_registers) => {
-                            let src_reg = old_registers[col_idx];
-                            program.emit_insn(Insn::Copy {
-                                src_reg,
-                                dst_reg: target_reg,
-                                extra_amount: 0,
-                            });
-                        }
-                    }
-                    Ok(())
-                },
-            ),
-        }
-    }
-
-    /// Shared logic for resolving a column reference in generated-column contexts
-    /// (UpdateGenerated and OldGenerated). Looks up the column by name, emits the
-    /// virtual column expression if virtual, or calls `emit_non_virtual` for regular columns.
-    #[allow(clippy::too_many_arguments)]
-    fn resolve_generated_column(
-        &self,
-        program: &mut ProgramBuilder,
-        col_name: &str,
-        original_name: &str,
-        column_lookup: &HashMap<String, usize>,
-        columns: &[crate::schema::Column],
-        target_reg: usize,
-        resolver: &Resolver,
-        emit_non_virtual: impl FnOnce(&mut ProgramBuilder, usize, &Column) -> Result<()>,
-    ) -> Result<()> {
-        if let Some(&col_idx) = column_lookup.get(&col_name.to_lowercase()) {
-            if let Some(col) = columns.get(col_idx) {
-                if let GeneratedType::Virtual(expr) = col.generated_type() {
-                    let affinity = col.affinity();
-                    return self
-                        .emit_virtual_column(program, expr, &affinity, target_reg, resolver);
-                }
-            }
-            let col = &columns[col_idx];
-            emit_non_virtual(program, col_idx, col)
-        } else {
-            crate::bail_parse_error!("unknown column: {}", original_name)
-        }
-    }
-
-    /// Get the affinity of an expression within this context.
-    ///
-    /// Used to determine type coercion rules for comparisons and binary operations.
-    pub fn get_expr_affinity(&self, expr: &ast::Expr) -> Affinity {
-        match expr {
-            // Column references - get affinity from schema
-            ast::Expr::Id(name) | ast::Expr::Qualified(_, name) => {
-                let col_name = crate::util::normalize_ident(name.as_str());
-                match self {
-                    ExprContext::InsertGenerated { col_mappings, .. } => col_mappings
-                        .iter()
-                        .find(|m| {
-                            m.column
-                                .name
-                                .as_ref()
-                                .is_some_and(|n| n.eq_ignore_ascii_case(&col_name))
-                        })
-                        .map(|m| m.column.affinity())
-                        .unwrap_or(Affinity::Blob),
-                    ExprContext::UpdateGenerated {
-                        column_lookup,
-                        columns,
-                        ..
-                    }
-                    | ExprContext::OldGenerated {
-                        column_lookup,
-                        columns,
-                        ..
-                    } => column_lookup
-                        .get(&col_name.to_lowercase())
-                        .and_then(|&idx| columns.get(idx))
-                        .map(|c| c.affinity())
-                        .unwrap_or(Affinity::Blob),
-                    ExprContext::VirtualColumn { table, .. } => table
-                        .get_column_by_name(&col_name)
-                        .map(|(_, c)| c.affinity())
-                        .unwrap_or(Affinity::Blob),
-                    ExprContext::Query { referenced_tables } => {
-                        // For Query context, delegate to the standard function
-                        get_expr_affinity(expr, *referenced_tables, None)
-                    }
-                }
-            }
-
-            // Literals have no affinity (they adapt to context)
-            ast::Expr::Literal(_) => Affinity::Blob,
-
-            // Cast expressions have the affinity of the target type
-            ast::Expr::Cast { type_name, .. } => {
-                if let Some(type_name) = type_name {
-                    Affinity::affinity(&type_name.name)
-                } else {
-                    Affinity::Blob
-                }
-            }
-
-            // Parenthesized expressions inherit from inner expression
-            ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-                self.get_expr_affinity(exprs.first().unwrap())
-            }
-
-            // Collate expressions inherit from inner expression
-            ast::Expr::Collate(inner, _) => self.get_expr_affinity(inner),
-
-            // Column expressions (already resolved) - use the referenced table
-            ast::Expr::Column {
-                table: table_ref_id,
-                column: col_idx,
-                ..
-            } => {
-                if let ExprContext::Query {
-                    referenced_tables: Some(tables),
-                } = self
-                {
-                    if let Some(joined) = tables.find_joined_table_by_internal_id(*table_ref_id) {
-                        return joined
-                            .table
-                            .columns()
-                            .get(*col_idx)
-                            .map(|c| c.affinity())
-                            .unwrap_or(Affinity::Blob);
-                    }
-                }
-                Affinity::Blob
-            }
-
-            // Everything else defaults to Blob (no affinity)
-            _ => Affinity::Blob,
-        }
-    }
-
-    /// Calculate comparison affinity for binary expressions.
-    ///
-    /// Determine the comparison affinity for two expressions according to SQLite rules.
-    /// SQLite uses column affinities to determine how values are compared.
-    pub fn comparison_affinity(&self, lhs: &ast::Expr, rhs: &ast::Expr) -> Affinity {
-        let lhs_aff = self.get_expr_affinity(lhs);
-        let rhs_aff = self.get_expr_affinity(rhs);
-
-        // Combine affinities according to SQLite rules
-        if lhs_aff.has_affinity() && rhs_aff.has_affinity() {
-            // Both sides have affinity - use numeric if either is numeric
-            if lhs_aff.is_numeric() || rhs_aff.is_numeric() {
-                Affinity::Numeric
-            } else {
-                Affinity::Blob
-            }
-        } else if lhs_aff.has_affinity() {
-            lhs_aff
-        } else if rhs_aff.has_affinity() {
-            rhs_aff
-        } else {
-            Affinity::Blob
-        }
-    }
-}
-
-/// Returns the register containing the expression result
-pub fn translate_expr_with_context(
-    program: &mut ProgramBuilder,
-    context: &ExprContext<'_>,
-    expr: &Box<Expr>,
-    target_register: usize,
-    resolver: &Resolver,
-) -> Result<usize> {
-    match context {
-        ExprContext::Query { referenced_tables } => {
-            translate_expr(program, *referenced_tables, expr, target_register, resolver)
-        }
-        ExprContext::VirtualColumn { .. } => {
-            translate_expr_for_gencol(program, context, expr, target_register, resolver)?;
-            Ok(target_register)
-        }
-        ExprContext::InsertGenerated { .. }
-        | ExprContext::UpdateGenerated { .. }
-        | ExprContext::OldGenerated { .. } => {
-            translate_expr_for_gencol(program, context, expr, target_register, resolver)?;
-            Ok(target_register)
-        }
-    }
-}
-fn translate_expr_for_gencol(
-    program: &mut ProgramBuilder,
-    context: &ExprContext<'_>,
-    expr: &Expr,
-    target_register: usize,
-    resolver: &Resolver,
-) -> Result<()> {
-    match expr {
-        Expr::Id(name) | Expr::Qualified(_, name) => {
-            context.resolve_column_by_name(program, name.as_str(), target_register, resolver)
-        }
-        Expr::Literal(lit) => translate_literal_for_gencol(program, lit, target_register),
-        Expr::Binary(lhs, op, rhs) => {
-            translate_binary_unified(program, context, lhs, op, rhs, target_register, resolver)
-        }
-        Expr::Unary(op, operand) => {
-            translate_expr_for_gencol(program, context, operand, target_register, resolver)?;
-            match op {
-                UnaryOperator::Negative => {
-                    let zero_reg = program.alloc_register();
-                    program.emit_insn(Insn::Integer {
-                        value: 0,
-                        dest: zero_reg,
-                    });
-                    program.emit_insn(Insn::Subtract {
-                        lhs: zero_reg,
-                        rhs: target_register,
-                        dest: target_register,
-                    });
-                }
-                UnaryOperator::Positive => {
-                    // no-op
-                }
-                UnaryOperator::Not => {
-                    program.emit_insn(Insn::Not {
-                        reg: target_register,
-                        dest: target_register,
-                    });
-                }
-                UnaryOperator::BitwiseNot => {
-                    program.emit_insn(Insn::BitNot {
-                        reg: target_register,
-                        dest: target_register,
-                    });
-                }
-            }
-            Ok(())
-        }
-        Expr::Parenthesized(inner) => {
-            if inner.len() == 1 {
-                translate_expr_for_gencol(program, context, &inner[0], target_register, resolver)
-            } else {
-                crate::bail_parse_error!(
-                    "multi-value parenthesized expressions not supported in generated columns"
-                )
-            }
-        }
-        Expr::FunctionCall { name, args, .. } => translate_function_call_for_gencol(
-            program,
-            context,
-            name.as_str(),
-            args,
-            target_register,
-            resolver,
-        ),
-        Expr::Case {
-            base,
-            when_then_pairs,
-            else_expr,
-        } => translate_case_for_gencol(
-            program,
-            context,
-            base.as_deref(),
-            when_then_pairs,
-            else_expr.as_deref(),
-            target_register,
-            resolver,
-        ),
-        Expr::Cast { expr, type_name } => {
-            let inner_reg = program.alloc_register();
-            translate_expr_for_gencol(program, context, expr, inner_reg, resolver)?;
-
-            let affinity = if let Some(type_name) = type_name {
-                Affinity::affinity(&type_name.name)
-            } else {
-                Affinity::Blob
-            };
-            program.emit_insn(Insn::Cast {
-                reg: inner_reg,
-                affinity,
-            });
-            program.emit_insn(Insn::Copy {
-                src_reg: inner_reg,
-                dst_reg: target_register,
-                extra_amount: 0,
-            });
-            Ok(())
-        }
-        Expr::InList { lhs, rhs, not } => translate_in_list_for_gencol(
-            program,
-            context,
-            lhs,
-            rhs,
-            *not,
-            target_register,
-            resolver,
-        ),
-        Expr::Like {
-            lhs,
-            op,
-            rhs,
-            not,
-            escape,
-        } => translate_like_for_gencol(
-            program,
-            context,
-            lhs,
-            op,
-            rhs,
-            *not,
-            escape.as_deref(),
-            target_register,
-            resolver,
-        ),
-        Expr::Between {
-            lhs,
-            not,
-            start,
-            end,
-        } => translate_between_for_gencol(
-            program,
-            context,
-            lhs,
-            *not,
-            start,
-            end,
-            target_register,
-            resolver,
-        ),
-        Expr::Collate(inner, _collation) => {
-            // For generated columns, collation affects comparison, not value storage, so we ignore collation
-            translate_expr_for_gencol(program, context, inner, target_register, resolver)
-        }
-        _ => {
-            crate::bail_parse_error!("expression type {expr:?} not supported in generated columns")
-        }
-    }
-}
-
-fn translate_literal_for_gencol(
-    program: &mut ProgramBuilder,
-    lit: &ast::Literal,
-    target_register: usize,
-) -> Result<()> {
-    match lit {
-        ast::Literal::Numeric(n) => {
-            if let Ok(i) = n.parse::<i64>() {
-                program.emit_insn(Insn::Integer {
-                    value: i,
-                    dest: target_register,
-                });
-            } else if let Ok(f) = n.parse::<f64>() {
-                program.emit_insn(Insn::Real {
-                    value: f,
-                    dest: target_register,
-                });
-            } else {
-                crate::bail_parse_error!("invalid numeric literal: {}", n);
-            }
-        }
-        ast::Literal::String(s) => {
-            let sanitized = sanitize_string(s);
-            program.emit_insn(Insn::String8 {
-                value: sanitized,
-                dest: target_register,
-            });
-        }
-        ast::Literal::Blob(b) => {
-            let bytes = b
-                .as_bytes()
-                .chunks_exact(2)
-                .map(|pair| {
-                    // the input is valid hex string, thus unwrap is safe.
-                    let hex_byte = std::str::from_utf8(pair).unwrap();
-                    u8::from_str_radix(hex_byte, 16).unwrap()
-                })
-                .collect();
-            program.emit_insn(Insn::Blob {
-                value: bytes,
-                dest: target_register,
-            });
-        }
-        ast::Literal::Null => {
-            program.emit_insn(Insn::Null {
-                dest: target_register,
-                dest_end: None,
-            });
-        }
-        ast::Literal::True => {
-            program.emit_insn(Insn::Integer {
-                value: 1,
-                dest: target_register,
-            });
-        }
-        ast::Literal::False => {
-            program.emit_insn(Insn::Integer {
-                value: 0,
-                dest: target_register,
-            });
-        }
-        ast::Literal::CurrentTime | ast::Literal::CurrentDate | ast::Literal::CurrentTimestamp => {
-            crate::bail_parse_error!("time literals in generated expressions not yet supported");
-        }
-        ast::Literal::Keyword(kw) => {
-            crate::bail_parse_error!(
-                "keyword literal '{}' not supported in generated expressions",
-                kw
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Translate a binary expression for generated columns.
-fn translate_binary_unified(
-    program: &mut ProgramBuilder,
-    context: &ExprContext<'_>,
-    lhs: &ast::Expr,
-    op: &ast::Operator,
-    rhs: &ast::Expr,
-    target_register: usize,
-    resolver: &Resolver,
-) -> Result<()> {
-    let lhs_reg = program.alloc_register();
-    let rhs_reg = program.alloc_register();
-    translate_expr_for_gencol(program, context, lhs, lhs_reg, resolver)?;
-    translate_expr_for_gencol(program, context, rhs, rhs_reg, resolver)?;
-
-    match op {
-        // Arithmetic operators
-        ast::Operator::Add => {
-            program.emit_insn(Insn::Add {
-                lhs: lhs_reg,
-                rhs: rhs_reg,
-                dest: target_register,
-            });
-        }
-        ast::Operator::Subtract => {
-            program.emit_insn(Insn::Subtract {
-                lhs: lhs_reg,
-                rhs: rhs_reg,
-                dest: target_register,
-            });
-        }
-        ast::Operator::Multiply => {
-            program.emit_insn(Insn::Multiply {
-                lhs: lhs_reg,
-                rhs: rhs_reg,
-                dest: target_register,
-            });
-        }
-        ast::Operator::Divide => {
-            program.emit_insn(Insn::Divide {
-                lhs: lhs_reg,
-                rhs: rhs_reg,
-                dest: target_register,
-            });
-        }
-        ast::Operator::Modulus => {
-            program.emit_insn(Insn::Remainder {
-                lhs: lhs_reg,
-                rhs: rhs_reg,
-                dest: target_register,
-            });
-        }
-        ast::Operator::Concat => {
-            program.emit_insn(Insn::Concat {
-                lhs: lhs_reg,
-                rhs: rhs_reg,
-                dest: target_register,
-            });
-        }
-
-        // Bitwise operators
-        ast::Operator::BitwiseAnd => {
-            program.emit_insn(Insn::BitAnd {
-                lhs: lhs_reg,
-                rhs: rhs_reg,
-                dest: target_register,
-            });
-        }
-        ast::Operator::BitwiseOr => {
-            program.emit_insn(Insn::BitOr {
-                lhs: lhs_reg,
-                rhs: rhs_reg,
-                dest: target_register,
-            });
-        }
-        ast::Operator::LeftShift => {
-            program.emit_insn(Insn::ShiftLeft {
-                lhs: lhs_reg,
-                rhs: rhs_reg,
-                dest: target_register,
-            });
-        }
-        ast::Operator::RightShift => {
-            program.emit_insn(Insn::ShiftRight {
-                lhs: lhs_reg,
-                rhs: rhs_reg,
-                dest: target_register,
-            });
-        }
-
-        // Logical operators
-        ast::Operator::And => {
-            program.emit_insn(Insn::And {
-                lhs: lhs_reg,
-                rhs: rhs_reg,
-                dest: target_register,
-            });
-        }
-        ast::Operator::Or => {
-            program.emit_insn(Insn::Or {
-                lhs: lhs_reg,
-                rhs: rhs_reg,
-                dest: target_register,
-            });
-        }
-
-        // Comparison operators
-        ast::Operator::Equals
-        | ast::Operator::NotEquals
-        | ast::Operator::Less
-        | ast::Operator::LessEquals
-        | ast::Operator::Greater
-        | ast::Operator::GreaterEquals => {
-            let affinity = context.comparison_affinity(lhs, rhs);
-            let flags = CmpInsFlags::default().with_affinity(affinity);
-            let if_true_label = program.allocate_label();
-
-            program.emit_insn(Insn::Integer {
-                value: 1,
-                dest: target_register,
-            });
-
-            match op {
-                ast::Operator::Equals => program.emit_insn(Insn::Eq {
-                    lhs: lhs_reg,
-                    rhs: rhs_reg,
-                    target_pc: if_true_label,
-                    flags,
-                    collation: program.curr_collation(),
-                }),
-                ast::Operator::NotEquals => program.emit_insn(Insn::Ne {
-                    lhs: lhs_reg,
-                    rhs: rhs_reg,
-                    target_pc: if_true_label,
-                    flags,
-                    collation: program.curr_collation(),
-                }),
-                ast::Operator::Less => program.emit_insn(Insn::Lt {
-                    lhs: lhs_reg,
-                    rhs: rhs_reg,
-                    target_pc: if_true_label,
-                    flags,
-                    collation: program.curr_collation(),
-                }),
-                ast::Operator::LessEquals => program.emit_insn(Insn::Le {
-                    lhs: lhs_reg,
-                    rhs: rhs_reg,
-                    target_pc: if_true_label,
-                    flags,
-                    collation: program.curr_collation(),
-                }),
-                ast::Operator::Greater => program.emit_insn(Insn::Gt {
-                    lhs: lhs_reg,
-                    rhs: rhs_reg,
-                    target_pc: if_true_label,
-                    flags,
-                    collation: program.curr_collation(),
-                }),
-                ast::Operator::GreaterEquals => program.emit_insn(Insn::Ge {
-                    lhs: lhs_reg,
-                    rhs: rhs_reg,
-                    target_pc: if_true_label,
-                    flags,
-                    collation: program.curr_collation(),
-                }),
-                _ => unreachable!(),
-            }
-
-            program.emit_insn(Insn::ZeroOrNull {
-                rg1: lhs_reg,
-                rg2: rhs_reg,
-                dest: target_register,
-            });
-            program.preassign_label_to_next_insn(if_true_label);
-        }
-
-        // IS / IS NOT operators
-        ast::Operator::Is => {
-            let if_true_label = program.allocate_label();
-            program.emit_insn(Insn::Integer {
-                value: 1,
-                dest: target_register,
-            });
-            program.emit_insn(Insn::Eq {
-                lhs: lhs_reg,
-                rhs: rhs_reg,
-                target_pc: if_true_label,
-                flags: CmpInsFlags::default().null_eq(),
-                collation: program.curr_collation(),
-            });
-            program.emit_insn(Insn::Integer {
-                value: 0,
-                dest: target_register,
-            });
-            program.preassign_label_to_next_insn(if_true_label);
-        }
-        ast::Operator::IsNot => {
-            let if_true_label = program.allocate_label();
-            program.emit_insn(Insn::Integer {
-                value: 1,
-                dest: target_register,
-            });
-            program.emit_insn(Insn::Ne {
-                lhs: lhs_reg,
-                rhs: rhs_reg,
-                target_pc: if_true_label,
-                flags: CmpInsFlags::default().null_eq(),
-                collation: program.curr_collation(),
-            });
-            program.emit_insn(Insn::Integer {
-                value: 0,
-                dest: target_register,
-            });
-            program.preassign_label_to_next_insn(if_true_label);
-        }
-
-        _ => {
-            crate::bail_parse_error!("operator {:?} not supported in generated expressions", op);
-        }
-    }
-    Ok(())
-}
-
-/// Translate a function call for generated columns.
-///
-/// Supports all 26 scalar functions plus special cases (coalesce, ifnull, iif).
-fn translate_function_call_for_gencol(
-    program: &mut ProgramBuilder,
-    context: &ExprContext<'_>,
-    name: &str,
-    args: &[Box<ast::Expr>],
-    target_register: usize,
-    resolver: &Resolver,
-) -> Result<()> {
-    let func_name = normalize_ident(name);
-    let arg_count = args.len();
-
-    // Handle iif specially - it requires lazy evaluation (short-circuit semantics)
-    // This must be done BEFORE evaluating all arguments to avoid evaluating unused branches
-    if func_name == "iif" {
-        if arg_count < 2 {
-            crate::bail_parse_error!("iif requires at least 2 arguments");
-        }
-        let iif_end_label = program.allocate_label();
-        let condition_reg = program.alloc_register();
-
-        // Process condition-value pairs: iif(cond1, val1, cond2, val2, ..., else_val)
-        for pair in args.chunks_exact(2) {
-            let condition_expr = &pair[0];
-            let value_expr = &pair[1];
-            let next_check_label = program.allocate_label();
-
-            translate_expr_for_gencol(
-                program,
-                context,
-                condition_expr.as_ref(),
-                condition_reg,
-                resolver,
-            )?;
-
-            program.emit_insn(Insn::IfNot {
-                reg: condition_reg,
-                target_pc: next_check_label,
-                jump_if_null: true,
-            });
-
-            translate_expr_for_gencol(
-                program,
-                context,
-                value_expr.as_ref(),
-                target_register,
-                resolver,
-            )?;
-            program.emit_insn(Insn::Goto {
-                target_pc: iif_end_label,
-            });
-
-            program.preassign_label_to_next_insn(next_check_label);
-        }
-
-        // Handle else value (odd number of args) or NULL
-        if arg_count % 2 != 0 {
-            translate_expr_for_gencol(
-                program,
-                context,
-                args.last().unwrap().as_ref(),
-                target_register,
-                resolver,
-            )?;
-        } else {
-            program.emit_insn(Insn::Null {
-                dest: target_register,
-                dest_end: None,
-            });
-        }
-
-        program.preassign_label_to_next_insn(iif_end_label);
-        return Ok(());
-    }
-
-    // Evaluate all arguments first
-    let args_start = program.alloc_registers(arg_count.max(1));
-    for (i, arg) in args.iter().enumerate() {
-        translate_expr_for_gencol(program, context, arg.as_ref(), args_start + i, resolver)?;
-    }
-
-    // Handle special cases that need control flow
-    match func_name.as_str() {
-        "coalesce" => {
-            let label_end = program.allocate_label();
-            for i in 0..arg_count {
-                let reg = args_start + i;
-                if i < arg_count - 1 {
-                    program.emit_insn(Insn::Copy {
-                        src_reg: reg,
-                        dst_reg: target_register,
-                        extra_amount: 0,
-                    });
-                    program.emit_insn(Insn::NotNull {
-                        reg: target_register,
-                        target_pc: label_end,
-                    });
-                } else {
-                    program.emit_insn(Insn::Copy {
-                        src_reg: reg,
-                        dst_reg: target_register,
-                        extra_amount: 0,
-                    });
-                }
-            }
-            program.preassign_label_to_next_insn(label_end);
-            return Ok(());
-        }
-        "ifnull" => {
-            if arg_count != 2 {
-                crate::bail_parse_error!("ifnull requires exactly 2 arguments");
-            }
-            let label_end = program.allocate_label();
-            program.emit_insn(Insn::Copy {
-                src_reg: args_start,
-                dst_reg: target_register,
-                extra_amount: 0,
-            });
-            program.emit_insn(Insn::NotNull {
-                reg: target_register,
-                target_pc: label_end,
-            });
-            program.emit_insn(Insn::Copy {
-                src_reg: args_start + 1,
-                dst_reg: target_register,
-                extra_amount: 0,
-            });
-            program.preassign_label_to_next_insn(label_end);
-            return Ok(());
-        }
-        _ => {}
-    }
-
-    // Resolve function via the standard infrastructure. Validation (deterministic check,
-    // no aggregates, etc.) already happened at CREATE TABLE time in validate_generated_expr.
-    let func = Func::resolve_function(&func_name, arg_count)?;
-    let func_ctx = FuncCtx { func, arg_count };
-
-    program.emit_insn(Insn::Function {
-        constant_mask: 0,
-        start_reg: args_start,
-        dest: target_register,
-        func: func_ctx,
-    });
-
-    Ok(())
-}
-
-/// Translate a CASE expression for generated columns.
-fn translate_case_for_gencol(
-    program: &mut ProgramBuilder,
-    context: &ExprContext<'_>,
-    base: Option<&ast::Expr>,
-    when_then_pairs: &[(Box<ast::Expr>, Box<ast::Expr>)],
-    else_expr: Option<&ast::Expr>,
-    target_register: usize,
-    resolver: &Resolver,
-) -> Result<()> {
-    let label_end = program.allocate_label();
-
-    if let Some(base_expr) = base {
-        // CASE base WHEN val1 THEN result1 ...
-        let base_reg = program.alloc_register();
-        translate_expr_for_gencol(program, context, base_expr, base_reg, resolver)?;
-
-        for (when_expr, then_expr) in when_then_pairs {
-            let when_reg = program.alloc_register();
-            translate_expr_for_gencol(program, context, when_expr.as_ref(), when_reg, resolver)?;
-
-            let next_when_label = program.allocate_label();
-            program.emit_insn(Insn::Ne {
-                lhs: base_reg,
-                rhs: when_reg,
-                target_pc: next_when_label,
-                flags: CmpInsFlags::default().jump_if_null(),
-                collation: program.curr_collation(),
-            });
-
-            translate_expr_for_gencol(
-                program,
-                context,
-                then_expr.as_ref(),
-                target_register,
-                resolver,
-            )?;
-            program.emit_insn(Insn::Goto {
-                target_pc: label_end,
-            });
-
-            program.preassign_label_to_next_insn(next_when_label);
-        }
-    } else {
-        // CASE WHEN condition1 THEN result1 ...
-        for (when_expr, then_expr) in when_then_pairs {
-            let when_reg = program.alloc_register();
-            translate_expr_for_gencol(program, context, when_expr.as_ref(), when_reg, resolver)?;
-
-            let next_when_label = program.allocate_label();
-            program.emit_insn(Insn::IfNot {
-                reg: when_reg,
-                target_pc: next_when_label,
-                jump_if_null: true,
-            });
-
-            translate_expr_for_gencol(
-                program,
-                context,
-                then_expr.as_ref(),
-                target_register,
-                resolver,
-            )?;
-            program.emit_insn(Insn::Goto {
-                target_pc: label_end,
-            });
-
-            program.preassign_label_to_next_insn(next_when_label);
-        }
-    }
-
-    // ELSE clause or NULL
-    if let Some(else_e) = else_expr {
-        translate_expr_for_gencol(program, context, else_e, target_register, resolver)?;
-    } else {
-        program.emit_insn(Insn::Null {
-            dest: target_register,
-            dest_end: None,
-        });
-    }
-
-    program.preassign_label_to_next_insn(label_end);
-    Ok(())
-}
-
-/// Translate an IN list expression for generated columns.
-fn translate_in_list_for_gencol(
-    program: &mut ProgramBuilder,
-    context: &ExprContext<'_>,
-    lhs: &ast::Expr,
-    rhs: &[Box<ast::Expr>],
-    not: bool,
-    target_register: usize,
-    resolver: &Resolver,
-) -> Result<()> {
-    let lhs_reg = program.alloc_register();
-    translate_expr_for_gencol(program, context, lhs, lhs_reg, resolver)?;
-
-    let label_found = program.allocate_label();
-    let label_not_found = program.allocate_label();
-    let label_end = program.allocate_label();
-
-    for item in rhs {
-        let item_reg = program.alloc_register();
-        translate_expr_for_gencol(program, context, item.as_ref(), item_reg, resolver)?;
-
-        program.emit_insn(Insn::Eq {
-            lhs: lhs_reg,
-            rhs: item_reg,
-            target_pc: label_found,
-            flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
-        });
-    }
-
-    // Not found in list
-    program.emit_insn(Insn::Goto {
-        target_pc: label_not_found,
-    });
-
-    // Found
-    program.preassign_label_to_next_insn(label_found);
-    program.emit_insn(Insn::Integer {
-        value: if not { 0 } else { 1 },
-        dest: target_register,
-    });
-    program.emit_insn(Insn::Goto {
-        target_pc: label_end,
-    });
-
-    // Not found
-    program.preassign_label_to_next_insn(label_not_found);
-    program.emit_insn(Insn::Integer {
-        value: if not { 1 } else { 0 },
-        dest: target_register,
-    });
-
-    program.preassign_label_to_next_insn(label_end);
-    Ok(())
-}
-
-/// Translate a LIKE/GLOB expression for generated columns.
-#[allow(clippy::too_many_arguments)]
-fn translate_like_for_gencol(
-    program: &mut ProgramBuilder,
-    context: &ExprContext<'_>,
-    lhs: &ast::Expr,
-    op: &ast::LikeOperator,
-    rhs: &ast::Expr,
-    not: bool,
-    escape: Option<&ast::Expr>,
-    target_register: usize,
-    resolver: &Resolver,
-) -> Result<()> {
-    let func = match op {
-        ast::LikeOperator::Like => ScalarFunc::Like,
-        ast::LikeOperator::Glob => ScalarFunc::Glob,
-        _ => crate::bail_parse_error!("MATCH operator not supported in generated expressions"),
-    };
-
-    let arg_count = if escape.is_some() { 3 } else { 2 };
-    let args_start = program.alloc_registers(arg_count);
-
-    // Pattern goes in first register, value to match in second
-    translate_expr_for_gencol(program, context, rhs, args_start, resolver)?;
-    translate_expr_for_gencol(program, context, lhs, args_start + 1, resolver)?;
-
-    if let Some(esc) = escape {
-        translate_expr_for_gencol(program, context, esc, args_start + 2, resolver)?;
-    }
-
-    let result_reg = if not {
-        program.alloc_register()
-    } else {
-        target_register
-    };
-
-    program.emit_insn(Insn::Function {
-        constant_mask: 0,
-        func: FuncCtx {
-            func: Func::Scalar(func),
-            arg_count,
-        },
-        start_reg: args_start,
-        dest: result_reg,
-    });
-
-    if not {
-        program.emit_insn(Insn::Not {
-            reg: result_reg,
-            dest: target_register,
-        });
-    }
-
-    Ok(())
-}
-
-/// Translate a BETWEEN expression for generated columns.
-#[allow(clippy::too_many_arguments)]
-fn translate_between_for_gencol(
-    program: &mut ProgramBuilder,
-    context: &ExprContext<'_>,
-    lhs: &ast::Expr,
-    not: bool,
-    start: &ast::Expr,
-    end: &ast::Expr,
-    target_register: usize,
-    resolver: &Resolver,
-) -> Result<()> {
-    let lhs_reg = program.alloc_register();
-    let start_reg = program.alloc_register();
-    let end_reg = program.alloc_register();
-
-    translate_expr_for_gencol(program, context, lhs, lhs_reg, resolver)?;
-    translate_expr_for_gencol(program, context, start, start_reg, resolver)?;
-    translate_expr_for_gencol(program, context, end, end_reg, resolver)?;
-
-    let label_false = program.allocate_label();
-    let label_end = program.allocate_label();
-
-    if not {
-        // NOT BETWEEN: lhs < start OR lhs > end => result is 1
-        let label_true = program.allocate_label();
-
-        program.emit_insn(Insn::Lt {
-            lhs: lhs_reg,
-            rhs: start_reg,
-            target_pc: label_true,
-            flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
-        });
-
-        program.emit_insn(Insn::Gt {
-            lhs: lhs_reg,
-            rhs: end_reg,
-            target_pc: label_true,
-            flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
-        });
-
-        program.emit_insn(Insn::Integer {
-            value: 0,
-            dest: target_register,
-        });
-        program.emit_insn(Insn::Goto {
-            target_pc: label_end,
-        });
-
-        program.preassign_label_to_next_insn(label_true);
-        program.emit_insn(Insn::Integer {
-            value: 1,
-            dest: target_register,
-        });
-    } else {
-        // BETWEEN: start <= lhs AND lhs <= end => result is 1
-        program.emit_insn(Insn::Lt {
-            lhs: lhs_reg,
-            rhs: start_reg,
-            target_pc: label_false,
-            flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
-        });
-
-        program.emit_insn(Insn::Gt {
-            lhs: lhs_reg,
-            rhs: end_reg,
-            target_pc: label_false,
-            flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
-        });
-
-        program.emit_insn(Insn::Integer {
-            value: 1,
-            dest: target_register,
-        });
-        program.emit_insn(Insn::Goto {
-            target_pc: label_end,
-        });
-
-        program.preassign_label_to_next_insn(label_false);
-        program.emit_insn(Insn::Integer {
-            value: 0,
-            dest: target_register,
-        });
-    }
-
-    program.preassign_label_to_next_insn(label_end);
-    Ok(())
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -4317,6 +3036,80 @@ pub fn translate_expr(
             table: table_ref_id,
             column,
             is_rowid_alias,
+        } if table_ref_id.is_self_table() => {
+            // Take the context out to avoid borrow conflict with `program`.
+            let ctx = program.self_table_context.take();
+            match ctx {
+                Some(SelfTableContext::Query {
+                    table_ref_id: real_id,
+                    ref referenced_tables,
+                }) => {
+                    let real_col = ast::Expr::Column {
+                        database: None,
+                        table: real_id,
+                        column: *column,
+                        is_rowid_alias: *is_rowid_alias,
+                    };
+                    // Restore context before recursive call (nested virtual cols may need it)
+                    program.self_table_context = Some(SelfTableContext::Query {
+                        table_ref_id: real_id,
+                        referenced_tables: referenced_tables.clone(),
+                    });
+                    return translate_expr(
+                        program,
+                        Some(referenced_tables),
+                        &real_col,
+                        target_register,
+                        resolver,
+                    );
+                }
+                Some(SelfTableContext::Registers {
+                    ref column_regs,
+                    ref columns,
+                }) => {
+                    // Check if the referenced column is itself a virtual column
+                    let is_virtual = columns.get(*column).and_then(|col| {
+                        if let GeneratedType::Virtual(gen_expr) = col.generated_type() {
+                            Some((gen_expr.clone(), col.affinity()))
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some((mut gen_expr, affinity)) = is_virtual {
+                        // Restore context before recursive eval
+                        program.self_table_context = ctx;
+                        let _guard = VirtualColumnRecursionGuard::new()?;
+                        rewrite_between_expr(&mut gen_expr);
+                        translate_expr(program, None, &gen_expr, target_register, resolver)?;
+                        program.emit_insn(Insn::Affinity {
+                            start_reg: target_register,
+                            count: std::num::NonZeroUsize::MIN,
+                            affinities: affinity.aff_mask().to_string(),
+                        });
+                        return Ok(target_register);
+                    }
+                    // Non-virtual column: copy from register
+                    let src_reg = column_regs[*column];
+                    program.self_table_context = ctx;
+                    program.emit_insn(Insn::Copy {
+                        src_reg,
+                        dst_reg: target_register,
+                        extra_amount: 0,
+                    });
+                    return Ok(target_register);
+                }
+                None => {
+                    crate::bail_parse_error!(
+                        "SELF_TABLE column reference outside of generated column context"
+                    );
+                }
+            }
+        }
+        ast::Expr::Column {
+            database: _,
+            table: table_ref_id,
+            column,
+            is_rowid_alias,
         } => {
             // When a cursor override is active for this table, we bypass all index logic
             // and read directly from the override cursor. This is used during hash join
@@ -4483,20 +3276,26 @@ pub fn translate_expr(
                                 // However, if we're reading from an index that contains this VIRTUAL column,
                                 // the index already has the pre-computed value - we can read it directly.
 
-                                // For virtual columns, we translate the generated expression.
-                                // Column references in the expression need to be translated recursively.
-                                let context = ExprContext::VirtualColumn {
-                                    table,
+                                // Set up SelfTableContext so that Expr::Column { SELF_TABLE }
+                                // in the generated expression remaps to the real table reference.
+                                let saved = program.self_table_context.take();
+                                program.self_table_context = Some(SelfTableContext::Query {
                                     table_ref_id: *table_ref_id,
-                                    referenced_tables,
-                                };
-                                translate_expr_with_context(
+                                    referenced_tables: referenced_tables.unwrap().clone(),
+                                });
+                                set_self_table_affinities(table.columns());
+                                let _guard = VirtualColumnRecursionGuard::new()?;
+                                let mut expr_rewritten = expr.as_ref().clone();
+                                rewrite_between_expr(&mut expr_rewritten);
+                                translate_expr(
                                     program,
-                                    &context,
-                                    expr,
+                                    referenced_tables,
+                                    &expr_rewritten,
                                     target_register,
                                     resolver,
                                 )?;
+                                clear_self_table_affinities();
+                                program.self_table_context = saved;
                                 // Apply the VIRTUAL column's declared affinity to the
                                 // computed result. The expression may produce a different
                                 // type (e.g. REAL when the column is INTEGER).
@@ -7411,6 +6210,11 @@ pub(crate) fn get_expr_affinity_info(
 ) -> ExprAffinityInfo {
     match expr {
         ast::Expr::Column { table, column, .. } => {
+            if table.is_self_table() {
+                return self_table_affinity(*column)
+                    .map(ExprAffinityInfo::with_affinity)
+                    .unwrap_or_else(ExprAffinityInfo::no_affinity);
+            }
             if let Some(tables) = referenced_tables {
                 if let Some((_, table_ref)) = tables.find_table_by_internal_id(*table) {
                     if let Some(col) = table_ref.get_column_at(*column) {

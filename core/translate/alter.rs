@@ -668,7 +668,10 @@ pub fn translate_alter_table(
             // Check if column is referenced by any generated column expression
             for col in btree.columns.iter() {
                 if let Some(generated_expr) = col.generated_expr() {
-                    let refs = crate::schema::collect_column_refs(generated_expr);
+                    let refs = crate::schema::collect_column_refs_with_columns(
+                        generated_expr,
+                        &btree.columns,
+                    );
                     if refs.contains(&column_name_norm) {
                         let gen_col_name = col.name.as_deref().unwrap_or("<unnamed>");
                         return Err(LimboError::ParseError(format!(
@@ -944,6 +947,9 @@ pub fn translate_alter_table(
 
             // TODO: All quoted ids will be quoted with `[]`, we should store some info from the parsed AST
             btree.columns.push(column.clone());
+            // We do NOT pre-resolve generated column names yet because btree.to_sql()
+            // must produce valid SQL with column names (not internal Expr::Column nodes).
+            // Pre-resolution happens after to_sql() below.
 
             // Add foreign key constraints and CHECK constraints to the btree table
             for constraint in &constraints {

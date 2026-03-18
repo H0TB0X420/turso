@@ -41,7 +41,7 @@ use crate::{
     util::normalize_ident,
     vdbe::{
         affinity::Affinity,
-        builder::{CursorKey, CursorType},
+        builder::{CursorKey, CursorType, SelfTableContext},
         insn::{to_u16, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
         BranchOffset,
     },
@@ -2477,26 +2477,45 @@ fn emit_update_insns<'a>(
     Ok(())
 }
 
-use crate::translate::expr::{translate_expr_with_context, ExprContext};
 /// Emit bytecode to evaluate a generated expression using register values.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_generated_expr_from_registers(
     program: &mut ProgramBuilder,
-    expr: &Box<ast::Expr>,
+    expr: &ast::Expr,
     target_reg: usize,
     registers_start: usize,
-    column_lookup: &HashMap<String, usize>,
+    _column_lookup: &HashMap<String, usize>,
     columns: &[crate::schema::Column],
     resolver: &Resolver,
     rowid_reg: Option<usize>,
 ) -> Result<()> {
-    let context = ExprContext::UpdateGenerated {
-        registers_start,
-        column_lookup,
-        columns,
-        rowid_reg,
-    };
-    translate_expr_with_context(program, &context, expr, target_reg, resolver)?;
+    // Build column_regs from contiguous registers, with rowid alias override
+    let column_regs: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, col)| {
+            if col.is_rowid_alias() {
+                if let Some(r) = rowid_reg {
+                    return r;
+                }
+            }
+            registers_start + i
+        })
+        .collect();
+
+    let saved_context = program.self_table_context.take();
+    crate::translate::expr::set_self_table_affinities(columns);
+    program.self_table_context = Some(SelfTableContext::Registers {
+        column_regs,
+        columns: columns.to_vec(),
+    });
+
+    let mut expr_rewritten = expr.clone();
+    crate::translate::expr::rewrite_between_expr(&mut expr_rewritten);
+    translate_expr(program, None, &expr_rewritten, target_reg, resolver)?;
+
+    crate::translate::expr::clear_self_table_affinities();
+    program.self_table_context = saved_context;
     Ok(())
 }
 
@@ -2521,8 +2540,6 @@ pub(super) fn compute_virtual_columns_for_update(
     column_lookup: &HashMap<String, usize>,
     resolver: &Resolver,
 ) -> crate::Result<()> {
-    use crate::translate::expr::{translate_expr_with_context, ExprContext, OldColumnSource};
-
     for (idx, column) in columns.iter().enumerate() {
         if let GeneratedType::Virtual(expr) = column.generated_type() {
             match registers {
@@ -2545,13 +2562,23 @@ pub(super) fn compute_virtual_columns_for_update(
                 }
                 VirtualColumnRegisters::Indexed(old_registers) => {
                     let target_reg = old_registers[idx];
-                    let context = ExprContext::OldGenerated {
-                        source: OldColumnSource::Registers(old_registers),
-                        column_lookup,
-                        columns,
-                    };
-                    translate_expr_with_context(program, &context, expr, target_reg, resolver)?;
+                    // Build column_regs from indexed registers
+                    let column_regs = old_registers.to_vec();
+
+                    let saved_context = program.self_table_context.take();
+                    crate::translate::expr::set_self_table_affinities(columns);
+                    program.self_table_context = Some(SelfTableContext::Registers {
+                        column_regs,
+                        columns: columns.to_vec(),
+                    });
+
+                    let mut expr_rewritten = expr.as_ref().clone();
+                    crate::translate::expr::rewrite_between_expr(&mut expr_rewritten);
+                    translate_expr(program, None, &expr_rewritten, target_reg, resolver)?;
                     program.emit_column_affinity(target_reg, column.affinity());
+
+                    crate::translate::expr::clear_self_table_affinities();
+                    program.self_table_context = saved_context;
                 }
             }
         }
