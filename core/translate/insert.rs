@@ -3364,7 +3364,7 @@ fn emit_index_column_value_for_insert(
             col_mappings: &insertion.col_mappings,
             rowid_alias,
         };
-        translate_expr_with_context(program, &context, &expr, dest_reg, resolver)?;
+        translate_expr_with_context(program, &context, expr, dest_reg, resolver)?;
         // Apply column affinity for VIRTUAL columns. This ensures INTEGER->REAL
         // conversions (and other affinity rules) happen per SQLite's documentation.
         if let Some(affinity) = &idx_col.affinity {

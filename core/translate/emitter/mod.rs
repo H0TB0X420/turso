@@ -727,13 +727,6 @@ pub fn emit_cdc_patch_record(
     }
 }
 
-/// Emit a MakeRecord that excludes VIRTUAL generated columns.
-///
-/// Accepts an iterator of `(source_register, &Column)` pairs representing
-/// every column (including virtual ones). Virtual columns are filtered out,
-/// and the remaining values are copied into a fresh contiguous register
-/// block so that MakeRecord sees no gaps. If there are no virtual columns,
-/// the original registers are used directly (no copy).
 pub(super) fn emit_make_record_without_virtual_columns<'a>(
     program: &mut ProgramBuilder,
     cols: impl IntoIterator<Item = (usize, &'a Column)>,
@@ -751,9 +744,7 @@ pub(super) fn emit_make_record_without_virtual_columns<'a>(
     let (record_start, record_count) = if storable_count < all_cols.len() {
         // There are virtual columns; create a compact representation by
         // copying all storable columns to contiguous registers.
-        // TODO we can compact in-place if any of these is true:
-        //  - there are no FKs of AFTER triggers
-        //  - all virtual columns are trailing
+        // TODO see if we can compact the registers in-place
         let record_start = program.alloc_registers(storable_count);
         for (compact_idx, &(src_reg, _)) in storable_cols.iter().enumerate() {
             program.emit_insn(Insn::Copy {
@@ -794,7 +785,7 @@ pub fn emit_cdc_full_record(
     let columns_reg = program.alloc_registers(columns.len() + 1);
     for (i, column) in columns.iter().enumerate() {
         if column.is_virtual_generated() {
-            //TODO compute generated column
+            //TODO compute generated column for CDC
             program.emit_null(columns_reg + 1 + i, None);
         } else if column.is_rowid_alias() {
             program.emit_insn(Insn::Copy {

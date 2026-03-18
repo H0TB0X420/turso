@@ -580,21 +580,7 @@ impl<'a> ExprContext<'a> {
     }
 }
 
-/// Translate an expression using the unified context-aware evaluator.
-///
-/// This function provides a unified entry point for expression evaluation
-/// that will eventually replace the 4 separate evaluators. Currently it
-/// delegates to the original `translate_expr` for Query context.
-///
-/// # Arguments
-/// * `program` - The program builder for emitting VDBE instructions
-/// * `context` - The evaluation context (Query, InsertGenerated, etc.)
-/// * `expr` - The AST expression to translate
-/// * `target_register` - Register where the result should be stored
-/// * `resolver` - Resolver for function lookup and expression caching
-///
-/// # Returns
-/// The register containing the expression result (usually target_register)
+/// Returns the register containing the expression result
 pub fn translate_expr_with_context(
     program: &mut ProgramBuilder,
     context: &ExprContext<'_>,
@@ -604,86 +590,67 @@ pub fn translate_expr_with_context(
 ) -> Result<usize> {
     match context {
         ExprContext::Query { referenced_tables } => {
-            // Delegate to the existing translate_expr for now
             translate_expr(program, *referenced_tables, expr, target_register, resolver)
         }
         ExprContext::VirtualColumn { .. } => {
-            // Use the unified implementation for virtual column expressions
-            // Column references (Expr::Id) are resolved via context.resolve_column_by_name(),
-            // which creates Expr::Column and delegates back to translate_expr for cursor access.
-            translate_generated_expr_unified(program, context, expr, target_register, resolver)?;
+            translate_expr_for_gencol(program, context, expr, target_register, resolver)?;
             Ok(target_register)
         }
-        // For generated column contexts, use the unified implementation
         ExprContext::InsertGenerated { .. }
         | ExprContext::UpdateGenerated { .. }
         | ExprContext::OldGenerated { .. } => {
-            translate_generated_expr_unified(program, context, expr, target_register, resolver)?;
+            translate_expr_for_gencol(program, context, expr, target_register, resolver)?;
             Ok(target_register)
         }
     }
 }
-
-/// Translate expressions for generated column contexts (InsertGenerated, UpdateGenerated).
-///
-/// This is the unified implementation that handles all expression types for generated
-/// and virtual column expressions. It supports InsertGenerated, UpdateGenerated, and
-/// VirtualColumn contexts.
-fn translate_generated_expr_unified(
+fn translate_expr_for_gencol(
     program: &mut ProgramBuilder,
     context: &ExprContext<'_>,
-    expr: &ast::Expr,
+    expr: &Expr,
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    use ast::Expr;
-
+    //TODO is this necessary? seems like we're duplicating work!
     match expr {
-        // ===== Column References =====
-        Expr::Id(_) | Expr::Qualified(_, _) => {
-            // Extract the column name
-            let name = match expr {
-                Expr::Id(n) => n.as_str(),
-                Expr::Qualified(_, n) => n.as_str(),
-                _ => unreachable!(),
-            };
-            context.resolve_column_by_name(program, name, target_register, resolver)
+        Expr::Id(name) | Expr::Qualified(_, name) => {
+            context.resolve_column_by_name(program, name.as_str(), target_register, resolver)
         }
-
-        // ===== Literals =====
-        Expr::Literal(lit) => translate_literal_unified(program, lit, target_register),
-
-        // ===== Binary Expressions =====
+        Expr::Literal(lit) => translate_literal_for_gencol(program, lit, target_register),
         Expr::Binary(lhs, op, rhs) => {
             translate_binary_unified(program, context, lhs, op, rhs, target_register, resolver)
         }
-
-        // ===== Unary Expressions =====
         Expr::Unary(op, operand) => {
-            translate_generated_expr_unified(program, context, operand, target_register, resolver)?;
+            translate_expr_for_gencol(
+                program,
+                context,
+                operand,
+                target_register,
+                resolver,
+            )?;
             match op {
-                ast::UnaryOperator::Negative => {
-                    let neg_one_reg = program.alloc_register();
+                UnaryOperator::Negative => {
+                    let zero_reg = program.alloc_register();
                     program.emit_insn(Insn::Integer {
-                        value: -1,
-                        dest: neg_one_reg,
+                        value: 0,
+                        dest: zero_reg,
                     });
-                    program.emit_insn(Insn::Multiply {
-                        lhs: target_register,
-                        rhs: neg_one_reg,
+                    program.emit_insn(Insn::Subtract {
+                        lhs: zero_reg,
+                        rhs: target_register,
                         dest: target_register,
                     });
                 }
-                ast::UnaryOperator::Positive => {
-                    // No-op
+                UnaryOperator::Positive => {
+                    // no-op
                 }
-                ast::UnaryOperator::Not => {
+                UnaryOperator::Not => {
                     program.emit_insn(Insn::Not {
                         reg: target_register,
                         dest: target_register,
                     });
                 }
-                ast::UnaryOperator::BitwiseNot => {
+                UnaryOperator::BitwiseNot => {
                     program.emit_insn(Insn::BitNot {
                         reg: target_register,
                         dest: target_register,
@@ -692,11 +659,9 @@ fn translate_generated_expr_unified(
             }
             Ok(())
         }
-
-        // ===== Parenthesized Expressions =====
         Expr::Parenthesized(inner) => {
             if inner.len() == 1 {
-                translate_generated_expr_unified(
+                translate_expr_for_gencol(
                     program,
                     context,
                     &inner[0],
@@ -709,15 +674,7 @@ fn translate_generated_expr_unified(
                 )
             }
         }
-
-        // ===== Function Calls =====
-        Expr::FunctionCall {
-            name,
-            args,
-            distinctness: _,
-            filter_over: _,
-            order_by: _,
-        } => translate_function_call_unified(
+        Expr::FunctionCall { name, args, .. } => translate_function_call_for_gencol(
             program,
             context,
             name.as_str(),
@@ -725,13 +682,11 @@ fn translate_generated_expr_unified(
             target_register,
             resolver,
         ),
-
-        // ===== CASE Expression =====
         Expr::Case {
             base,
             when_then_pairs,
             else_expr,
-        } => translate_case_unified(
+        } => translate_case_for_gencol(
             program,
             context,
             base.as_deref(),
@@ -740,11 +695,9 @@ fn translate_generated_expr_unified(
             target_register,
             resolver,
         ),
-
-        // ===== CAST Expression =====
         Expr::Cast { expr, type_name } => {
             let inner_reg = program.alloc_register();
-            translate_generated_expr_unified(program, context, expr, inner_reg, resolver)?;
+            translate_expr_for_gencol(program, context, expr, inner_reg, resolver)?;
 
             let affinity = if let Some(type_name) = type_name {
                 Affinity::affinity(&type_name.name)
@@ -762,20 +715,16 @@ fn translate_generated_expr_unified(
             });
             Ok(())
         }
-
-        // ===== IN List =====
         Expr::InList { lhs, rhs, not } => {
-            translate_in_list_unified(program, context, lhs, rhs, *not, target_register, resolver)
+            translate_in_list_for_gencol(program, context, lhs, rhs, *not, target_register, resolver)
         }
-
-        // ===== LIKE/GLOB =====
         Expr::Like {
             lhs,
             op,
             rhs,
             not,
             escape,
-        } => translate_like_unified(
+        } => translate_like_for_gencol(
             program,
             context,
             lhs,
@@ -786,14 +735,12 @@ fn translate_generated_expr_unified(
             target_register,
             resolver,
         ),
-
-        // ===== BETWEEN =====
         Expr::Between {
             lhs,
             not,
             start,
             end,
-        } => translate_between_unified(
+        } => translate_between_for_gencol(
             program,
             context,
             lhs,
@@ -803,11 +750,9 @@ fn translate_generated_expr_unified(
             target_register,
             resolver,
         ),
-
-        // ===== Collate =====
         Expr::Collate(inner, _collation) => {
-            // For generated columns, collation affects comparison, not value storage
-            translate_generated_expr_unified(program, context, inner, target_register, resolver)
+            // For generated columns, collation affects comparison, not value storage, so we ignore collation
+            translate_expr_for_gencol(program, context, inner, target_register, resolver)
         }
 
         // ===== Unsupported expressions =====
@@ -821,7 +766,7 @@ fn translate_generated_expr_unified(
 }
 
 /// Translate a literal value for generated columns.
-fn translate_literal_unified(
+fn translate_literal_for_gencol(
     program: &mut ProgramBuilder,
     lit: &ast::Literal,
     target_register: usize,
@@ -908,8 +853,8 @@ fn translate_binary_unified(
 ) -> Result<()> {
     let lhs_reg = program.alloc_register();
     let rhs_reg = program.alloc_register();
-    translate_generated_expr_unified(program, context, lhs, lhs_reg, resolver)?;
-    translate_generated_expr_unified(program, context, rhs, rhs_reg, resolver)?;
+    translate_expr_for_gencol(program, context, lhs, lhs_reg, resolver)?;
+    translate_expr_for_gencol(program, context, rhs, rhs_reg, resolver)?;
 
     match op {
         // Arithmetic operators
@@ -1122,7 +1067,7 @@ fn translate_binary_unified(
 /// Translate a function call for generated columns.
 ///
 /// Supports all 26 scalar functions plus special cases (coalesce, ifnull, iif).
-fn translate_function_call_unified(
+fn translate_function_call_for_gencol(
     program: &mut ProgramBuilder,
     context: &ExprContext<'_>,
     name: &str,
@@ -1148,7 +1093,7 @@ fn translate_function_call_unified(
             let value_expr = &pair[1];
             let next_check_label = program.allocate_label();
 
-            translate_generated_expr_unified(
+            translate_expr_for_gencol(
                 program,
                 context,
                 condition_expr.as_ref(),
@@ -1162,7 +1107,7 @@ fn translate_function_call_unified(
                 jump_if_null: true,
             });
 
-            translate_generated_expr_unified(
+            translate_expr_for_gencol(
                 program,
                 context,
                 value_expr.as_ref(),
@@ -1178,7 +1123,7 @@ fn translate_function_call_unified(
 
         // Handle else value (odd number of args) or NULL
         if arg_count % 2 != 0 {
-            translate_generated_expr_unified(
+            translate_expr_for_gencol(
                 program,
                 context,
                 args.last().unwrap().as_ref(),
@@ -1199,7 +1144,13 @@ fn translate_function_call_unified(
     // Evaluate all arguments first
     let args_start = program.alloc_registers(arg_count.max(1));
     for (i, arg) in args.iter().enumerate() {
-        translate_generated_expr_unified(program, context, arg.as_ref(), args_start + i, resolver)?;
+        translate_expr_for_gencol(
+            program,
+            context,
+            arg.as_ref(),
+            args_start + i,
+            resolver,
+        )?;
     }
 
     // Handle special cases that need control flow
@@ -1270,7 +1221,7 @@ fn translate_function_call_unified(
 }
 
 /// Translate a CASE expression for generated columns.
-fn translate_case_unified(
+fn translate_case_for_gencol(
     program: &mut ProgramBuilder,
     context: &ExprContext<'_>,
     base: Option<&ast::Expr>,
@@ -1284,11 +1235,11 @@ fn translate_case_unified(
     if let Some(base_expr) = base {
         // CASE base WHEN val1 THEN result1 ...
         let base_reg = program.alloc_register();
-        translate_generated_expr_unified(program, context, base_expr, base_reg, resolver)?;
+        translate_expr_for_gencol(program, context, base_expr, base_reg, resolver)?;
 
         for (when_expr, then_expr) in when_then_pairs {
             let when_reg = program.alloc_register();
-            translate_generated_expr_unified(
+            translate_expr_for_gencol(
                 program,
                 context,
                 when_expr.as_ref(),
@@ -1305,7 +1256,7 @@ fn translate_case_unified(
                 collation: program.curr_collation(),
             });
 
-            translate_generated_expr_unified(
+            translate_expr_for_gencol(
                 program,
                 context,
                 then_expr.as_ref(),
@@ -1322,7 +1273,7 @@ fn translate_case_unified(
         // CASE WHEN condition1 THEN result1 ...
         for (when_expr, then_expr) in when_then_pairs {
             let when_reg = program.alloc_register();
-            translate_generated_expr_unified(
+            translate_expr_for_gencol(
                 program,
                 context,
                 when_expr.as_ref(),
@@ -1337,7 +1288,7 @@ fn translate_case_unified(
                 jump_if_null: true,
             });
 
-            translate_generated_expr_unified(
+            translate_expr_for_gencol(
                 program,
                 context,
                 then_expr.as_ref(),
@@ -1354,7 +1305,7 @@ fn translate_case_unified(
 
     // ELSE clause or NULL
     if let Some(else_e) = else_expr {
-        translate_generated_expr_unified(program, context, else_e, target_register, resolver)?;
+        translate_expr_for_gencol(program, context, else_e, target_register, resolver)?;
     } else {
         program.emit_insn(Insn::Null {
             dest: target_register,
@@ -1367,7 +1318,7 @@ fn translate_case_unified(
 }
 
 /// Translate an IN list expression for generated columns.
-fn translate_in_list_unified(
+fn translate_in_list_for_gencol(
     program: &mut ProgramBuilder,
     context: &ExprContext<'_>,
     lhs: &ast::Expr,
@@ -1377,7 +1328,7 @@ fn translate_in_list_unified(
     resolver: &Resolver,
 ) -> Result<()> {
     let lhs_reg = program.alloc_register();
-    translate_generated_expr_unified(program, context, lhs, lhs_reg, resolver)?;
+    translate_expr_for_gencol(program, context, lhs, lhs_reg, resolver)?;
 
     let label_found = program.allocate_label();
     let label_not_found = program.allocate_label();
@@ -1385,7 +1336,7 @@ fn translate_in_list_unified(
 
     for item in rhs {
         let item_reg = program.alloc_register();
-        translate_generated_expr_unified(program, context, item.as_ref(), item_reg, resolver)?;
+        translate_expr_for_gencol(program, context, item.as_ref(), item_reg, resolver)?;
 
         program.emit_insn(Insn::Eq {
             lhs: lhs_reg,
@@ -1424,7 +1375,7 @@ fn translate_in_list_unified(
 
 /// Translate a LIKE/GLOB expression for generated columns.
 #[allow(clippy::too_many_arguments)]
-fn translate_like_unified(
+fn translate_like_for_gencol(
     program: &mut ProgramBuilder,
     context: &ExprContext<'_>,
     lhs: &ast::Expr,
@@ -1445,11 +1396,11 @@ fn translate_like_unified(
     let args_start = program.alloc_registers(arg_count);
 
     // Pattern goes in first register, value to match in second
-    translate_generated_expr_unified(program, context, rhs, args_start, resolver)?;
-    translate_generated_expr_unified(program, context, lhs, args_start + 1, resolver)?;
+    translate_expr_for_gencol(program, context, rhs, args_start, resolver)?;
+    translate_expr_for_gencol(program, context, lhs, args_start + 1, resolver)?;
 
     if let Some(esc) = escape {
-        translate_generated_expr_unified(program, context, esc, args_start + 2, resolver)?;
+        translate_expr_for_gencol(program, context, esc, args_start + 2, resolver)?;
     }
 
     let result_reg = if not {
@@ -1480,7 +1431,7 @@ fn translate_like_unified(
 
 /// Translate a BETWEEN expression for generated columns.
 #[allow(clippy::too_many_arguments)]
-fn translate_between_unified(
+fn translate_between_for_gencol(
     program: &mut ProgramBuilder,
     context: &ExprContext<'_>,
     lhs: &ast::Expr,
@@ -1494,9 +1445,9 @@ fn translate_between_unified(
     let start_reg = program.alloc_register();
     let end_reg = program.alloc_register();
 
-    translate_generated_expr_unified(program, context, lhs, lhs_reg, resolver)?;
-    translate_generated_expr_unified(program, context, start, start_reg, resolver)?;
-    translate_generated_expr_unified(program, context, end, end_reg, resolver)?;
+    translate_expr_for_gencol(program, context, lhs, lhs_reg, resolver)?;
+    translate_expr_for_gencol(program, context, start, start_reg, resolver)?;
+    translate_expr_for_gencol(program, context, end, end_reg, resolver)?;
 
     let label_false = program.allocate_label();
     let label_end = program.allocate_label();

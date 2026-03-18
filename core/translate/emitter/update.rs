@@ -2475,9 +2475,8 @@ fn emit_update_insns<'a>(
     Ok(())
 }
 
+use crate::translate::expr::{translate_expr_with_context, ExprContext};
 /// Emit bytecode to evaluate a generated expression using register values.
-/// This is used for generated columns in UPDATE, where the expression
-/// should use the NEW values of columns (from registers) rather than old values (from cursor).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_generated_expr_from_registers(
     program: &mut ProgramBuilder,
@@ -2488,10 +2487,7 @@ pub(super) fn emit_generated_expr_from_registers(
     columns: &[crate::schema::Column],
     resolver: &Resolver,
     rowid_reg: Option<usize>,
-) -> crate::Result<()> {
-    use crate::translate::expr::{translate_expr_with_context, ExprContext};
-
-    // Use the unified evaluator with UpdateGenerated context
+) -> Result<()> {
     let context = ExprContext::UpdateGenerated {
         registers_start,
         column_lookup,
