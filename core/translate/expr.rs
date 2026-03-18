@@ -611,7 +611,6 @@ fn translate_expr_for_gencol(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    //TODO is this necessary? seems like we're duplicating work!
     match expr {
         Expr::Id(name) | Expr::Qualified(_, name) => {
             context.resolve_column_by_name(program, name.as_str(), target_register, resolver)
@@ -621,13 +620,7 @@ fn translate_expr_for_gencol(
             translate_binary_unified(program, context, lhs, op, rhs, target_register, resolver)
         }
         Expr::Unary(op, operand) => {
-            translate_expr_for_gencol(
-                program,
-                context,
-                operand,
-                target_register,
-                resolver,
-            )?;
+            translate_expr_for_gencol(program, context, operand, target_register, resolver)?;
             match op {
                 UnaryOperator::Negative => {
                     let zero_reg = program.alloc_register();
@@ -661,13 +654,7 @@ fn translate_expr_for_gencol(
         }
         Expr::Parenthesized(inner) => {
             if inner.len() == 1 {
-                translate_expr_for_gencol(
-                    program,
-                    context,
-                    &inner[0],
-                    target_register,
-                    resolver,
-                )
+                translate_expr_for_gencol(program, context, &inner[0], target_register, resolver)
             } else {
                 crate::bail_parse_error!(
                     "multi-value parenthesized expressions not supported in generated columns"
@@ -715,9 +702,15 @@ fn translate_expr_for_gencol(
             });
             Ok(())
         }
-        Expr::InList { lhs, rhs, not } => {
-            translate_in_list_for_gencol(program, context, lhs, rhs, *not, target_register, resolver)
-        }
+        Expr::InList { lhs, rhs, not } => translate_in_list_for_gencol(
+            program,
+            context,
+            lhs,
+            rhs,
+            *not,
+            target_register,
+            resolver,
+        ),
         Expr::Like {
             lhs,
             op,
@@ -754,18 +747,12 @@ fn translate_expr_for_gencol(
             // For generated columns, collation affects comparison, not value storage, so we ignore collation
             translate_expr_for_gencol(program, context, inner, target_register, resolver)
         }
-
-        // ===== Unsupported expressions =====
         _ => {
-            crate::bail_parse_error!(
-                "expression type {:?} not supported in generated columns",
-                std::mem::discriminant(expr)
-            )
+            crate::bail_parse_error!("expression type {expr:?} not supported in generated columns")
         }
     }
 }
 
-/// Translate a literal value for generated columns.
 fn translate_literal_for_gencol(
     program: &mut ProgramBuilder,
     lit: &ast::Literal,
@@ -799,7 +786,6 @@ fn translate_literal_for_gencol(
                 .as_bytes()
                 .chunks_exact(2)
                 .map(|pair| {
-                    // We assume that sqlite3-parser has already validated that
                     // the input is valid hex string, thus unwrap is safe.
                     let hex_byte = std::str::from_utf8(pair).unwrap();
                     u8::from_str_radix(hex_byte, 16).unwrap()
@@ -1144,13 +1130,7 @@ fn translate_function_call_for_gencol(
     // Evaluate all arguments first
     let args_start = program.alloc_registers(arg_count.max(1));
     for (i, arg) in args.iter().enumerate() {
-        translate_expr_for_gencol(
-            program,
-            context,
-            arg.as_ref(),
-            args_start + i,
-            resolver,
-        )?;
+        translate_expr_for_gencol(program, context, arg.as_ref(), args_start + i, resolver)?;
     }
 
     // Handle special cases that need control flow
@@ -1239,13 +1219,7 @@ fn translate_case_for_gencol(
 
         for (when_expr, then_expr) in when_then_pairs {
             let when_reg = program.alloc_register();
-            translate_expr_for_gencol(
-                program,
-                context,
-                when_expr.as_ref(),
-                when_reg,
-                resolver,
-            )?;
+            translate_expr_for_gencol(program, context, when_expr.as_ref(), when_reg, resolver)?;
 
             let next_when_label = program.allocate_label();
             program.emit_insn(Insn::Ne {
@@ -1273,13 +1247,7 @@ fn translate_case_for_gencol(
         // CASE WHEN condition1 THEN result1 ...
         for (when_expr, then_expr) in when_then_pairs {
             let when_reg = program.alloc_register();
-            translate_expr_for_gencol(
-                program,
-                context,
-                when_expr.as_ref(),
-                when_reg,
-                resolver,
-            )?;
+            translate_expr_for_gencol(program, context, when_expr.as_ref(), when_reg, resolver)?;
 
             let next_when_label = program.allocate_label();
             program.emit_insn(Insn::IfNot {
