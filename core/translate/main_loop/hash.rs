@@ -421,7 +421,6 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                         GeneratedType::Virtual(expr) => {
                             use crate::translate::expr::{
                                 clear_self_table_affinities, set_self_table_affinities,
-                                RecursionGuard,
                             };
                             use crate::vdbe::builder::SelfTableContext;
 
@@ -431,7 +430,6 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                                 referenced_tables: planner.table_references.clone(),
                             });
                             set_self_table_affinities(build_table.table.columns());
-                            let _guard = RecursionGuard::new()?;
                             translate_expr(
                                 planner.program,
                                 Some(planner.table_references),

@@ -414,7 +414,6 @@ fn translate_integrity_check_impl(
                                     referenced_tables: table_references.clone(),
                                 });
                         }
-                        let mut expr = expr.clone();
                         translate_expr_no_constant_opt(
                             program,
                             Some(&table_references),

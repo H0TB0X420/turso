@@ -134,12 +134,6 @@ fn build_between_terms(
     (lower_expr, upper_expr, combine_op)
 }
 
-/// RAII guard for virtual column recursion depth.
-///
-/// Increments a thread-local depth counter on creation and decrements on drop,
-/// ensuring correct cleanup even when errors cause early returns.
-const MAX_RECURSION_DEPTH: u32 = 100;
-
 thread_local! {
     static RECURSION_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// Column affinities for SELF_TABLE columns, set during generated column evaluation.
@@ -164,29 +158,6 @@ pub(crate) fn clear_self_table_affinities() {
 /// Look up affinity for a SELF_TABLE column index.
 fn self_table_affinity(column: usize) -> Option<Affinity> {
     SELF_TABLE_AFFINITIES.with(|a| a.borrow().get(column).copied())
-}
-
-pub(crate) struct RecursionGuard;
-
-impl RecursionGuard {
-    pub(crate) fn new() -> Result<Self> {
-        RECURSION_DEPTH.with(|d| {
-            let cur = d.get();
-            if cur >= MAX_RECURSION_DEPTH {
-                crate::bail_parse_error!(
-                    "virtual column evaluation exceeded maximum recursion depth"
-                );
-            }
-            d.set(cur + 1);
-            Ok(RecursionGuard)
-        })
-    }
-}
-
-impl Drop for RecursionGuard {
-    fn drop(&mut self) {
-        RECURSION_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-    }
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -3058,7 +3029,6 @@ pub fn translate_expr(
                     if let Some((gen_expr, affinity)) = is_virtual {
                         // Restore context before recursive eval
                         program.self_table_context = ctx;
-                        let _guard = RecursionGuard::new()?;
                         translate_expr(program, None, &gen_expr, target_register, resolver)?;
                         program.emit_insn(Insn::Affinity {
                             start_reg: target_register,
@@ -3263,12 +3233,10 @@ pub fn translate_expr(
                                     referenced_tables: referenced_tables.unwrap().clone(),
                                 });
                                 set_self_table_affinities(table.columns());
-                                let _guard = RecursionGuard::new()?;
-                                let expr_rewritten = expr.as_ref().clone();
                                 translate_expr(
                                     program,
                                     referenced_tables,
-                                    &expr_rewritten,
+                                    &expr,
                                     target_register,
                                     resolver,
                                 )?;

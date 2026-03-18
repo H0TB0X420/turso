@@ -1,3 +1,4 @@
+use crate::Level;
 use crate::translate::collate::{get_expr_collation_ctx, CollationSeq};
 use crate::translate::emitter::delete::emit_program_for_delete;
 use crate::translate::emitter::select::emit_program_for_select;
@@ -1409,7 +1410,8 @@ pub(crate) fn emit_index_column_value_old_image(
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
 
-        let joined = table_references.joined_tables().first(); //TODO will this work if right_join_swapped is true?
+        //TODO will this work if right_join_swapped is true?
+        let joined = table_references.joined_tables().first();
         let self_table_context = program.self_table_context.take();
         if let Some(jt) = joined {
             set_self_table_affinities(jt.table.columns());

@@ -2510,8 +2510,7 @@ pub(super) fn emit_generated_expr_from_registers(
         columns: columns.to_vec(),
     });
 
-    let expr_rewritten = expr.clone();
-    translate_expr(program, None, &expr_rewritten, target_reg, resolver)?;
+    translate_expr(program, None, &expr, target_reg, resolver)?;
 
     crate::translate::expr::clear_self_table_affinities();
     program.self_table_context = saved_context;
@@ -2571,8 +2570,7 @@ pub(super) fn compute_virtual_columns_for_update(
                         columns: columns.to_vec(),
                     });
 
-                    let expr_rewritten = expr.as_ref().clone();
-                    translate_expr(program, None, &expr_rewritten, target_reg, resolver)?;
+                    translate_expr(program, None, &expr, target_reg, resolver)?;
                     program.emit_column_affinity(target_reg, column.affinity());
 
                     crate::translate::expr::clear_self_table_affinities();
