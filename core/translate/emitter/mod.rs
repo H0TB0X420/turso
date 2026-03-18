@@ -1467,36 +1467,29 @@ fn emit_index_column_value_new_image(
             is_strict,
         )?;
 
-        {
-            // Set up SelfTableContext for any SELF_TABLE refs in the expression
-            // (e.g., index on a virtual column whose expression references other columns).
-            let saved_ctx = program.self_table_context.take();
-            let column_regs: Vec<usize> = columns
-                .iter()
-                .enumerate()
-                .map(|(i, col)| {
-                    if col.is_rowid_alias() {
-                        return rowid_reg;
-                    }
-                    columns_start_reg + i
-                })
-                .collect();
-            program.self_table_context = Some(SelfTableContext::ForDML {
-                column_regs,
-                columns: columns.to_vec(),
-            });
+        let column_regs: Vec<usize> = columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| {
+                if col.is_rowid_alias() { //TODO this pattern is used all over the place, see if we can extract it
+                    return rowid_reg;
+                }
+                columns_start_reg + i
+            })
+            .collect();
+        program.self_table_context = Some(SelfTableContext::ForDML {
+            column_regs,
+            columns: columns.to_vec(),
+        });
 
-            translate_expr_no_constant_opt(
-                program,
-                None,
-                &expr,
-                dest_reg,
-                resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
-
-            program.self_table_context = saved_ctx;
-        }
+        translate_expr_no_constant_opt(
+            program,
+            None,
+            &expr,
+            dest_reg,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
     } else {
         let col_in_table = columns
             .get(idx_col.pos_in_table)

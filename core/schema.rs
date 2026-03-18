@@ -1892,10 +1892,9 @@ pub enum Table {
     FromClauseSubquery(Arc<FromClauseSubquery>),
 }
 
-//FIXME
+//TODO
 // 1 - this needs to use normalize_ident
 // 2 - this is called way too many times, it should be cached somewhere
-// 3 - for now we could just brute-force the search
 /// Build a map from lowercased column names to their indices.
 pub fn build_column_name_lookup(columns: &[Column]) -> HashMap<String, usize> {
     columns
