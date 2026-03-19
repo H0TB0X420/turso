@@ -1411,15 +1411,11 @@ pub(crate) fn emit_index_column_value_old_image(
 
         //TODO will this work if right_join_swapped is true?
         let joined = table_references.joined_tables().first();
-        let self_table_context = if let Some(jt) = joined {
-            Some(SelfTableContext::ForSelect {
+        let self_table_context = joined.map(|jt| SelfTableContext::ForSelect {
                 table_ref_id: jt.internal_id,
                 referenced_tables: table_references.clone(),
-            })
-        } else {
-            None
-        };
-        program.with_self_table_context(self_table_context, |program| {
+            });
+        program.with_self_table_context(self_table_context.as_ref(), |program, _| {
             translate_expr_no_constant_opt(
                 program,
                 Some(table_references),
@@ -1470,12 +1466,12 @@ fn emit_index_column_value_new_image(
         )?;
 
         program.with_self_table_context(
-            Some(SelfTableContext::for_contiguous_regs(
+            Some(&SelfTableContext::for_contiguous_regs(
                 columns,
                 columns_start_reg,
                 Some(rowid_reg),
             )),
-            |program| {
+            |program, _| {
                 translate_expr_no_constant_opt(
                     program,
                     None,

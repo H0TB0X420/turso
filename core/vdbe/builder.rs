@@ -240,9 +240,8 @@ pub struct ProgramBuilder {
     /// Maps table internal_id to result_columns_start_reg for FROM clause subqueries.
     /// Used when nested subqueries need to reference columns from outer query subqueries.
     subquery_result_regs: HashMap<TableInternalId, usize>,
-    /// Context for resolving Expr::Column with TableInternalId::SELF_TABLE.
-    /// Set during generated column evaluation, None otherwise.
-    pub self_table_context: Option<SelfTableContext>,
+    /// Context for resolving Expr::Column with [TableInternalId::SELF_TABLE].
+    self_table_context: Option<SelfTableContext>,
     /// Counter for CTE identity tracking. Each CTE definition gets a unique ID
     /// so that multiple references to the same CTE can share materialized data.
     next_cte_id: usize,
@@ -1782,15 +1781,25 @@ impl ProgramBuilder {
         Ok(Program::from_prepared(Arc::new(prepared), connection))
     }
 
-    pub fn with_self_table_context(
+    pub fn with_existing_self_table_context<T>(
         &mut self,
-        ctx: Option<SelfTableContext>,
-        f: impl FnOnce(&mut ProgramBuilder) -> crate::Result<()>,
-    ) -> crate::Result<()> {
-        let old_ctx = self.self_table_context.take();
-        self.self_table_context = ctx;
-        f(self)?;
-        self.self_table_context = old_ctx;
-        Ok(())
+        f: impl FnOnce(&mut ProgramBuilder, Option<&SelfTableContext>) -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        let self_table_context = self.self_table_context.take();
+        let result = f(self, self_table_context.as_ref())?;
+        self.self_table_context = self_table_context;
+        Ok(result)
+    }
+
+    pub fn with_self_table_context<T>(
+        &mut self,
+        ctx: Option<&SelfTableContext>,
+        f: impl FnOnce(&mut ProgramBuilder, Option<&SelfTableContext>) -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        f(self, ctx)
+    }
+
+    pub fn self_table_context(&self) -> &Option<SelfTableContext> {
+        &self.self_table_context
     }
 }

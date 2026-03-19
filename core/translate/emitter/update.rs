@@ -2483,12 +2483,12 @@ pub(super) fn emit_gencol_expr_from_registers(
     rowid_reg: Option<usize>,
 ) -> Result<()> {
     program.with_self_table_context(
-        Some(SelfTableContext::for_contiguous_regs(
+        Some(&SelfTableContext::for_contiguous_regs(
             columns,
             registers_start,
             rowid_reg,
         )),
-        |program| {
+        |program, _| {
             translate_expr(program, None, expr, target_reg, resolver)?;
             Ok(())
         },
@@ -2541,11 +2541,11 @@ pub(super) fn compute_virtual_columns_for_update(
                 let column_regs = old_registers.to_vec();
 
                 program.with_self_table_context(
-                    Some(SelfTableContext::ForDML {
+                    Some(&SelfTableContext::ForDML {
                         column_regs,
                         columns: columns.to_vec(),
                     }),
-                    |program| {
+                    |program, _| {
                         translate_expr(program, None, expr, target_reg, resolver)?;
                         Ok(())
                     },

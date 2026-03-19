@@ -19,7 +19,7 @@ use crate::translate::insert::format_unique_violation_desc;
 use crate::translate::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
 };
-use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts};
+use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
 use crate::vdbe::insn::{to_u16, CmpInsFlags, Cookie};
 use crate::{bail_parse_error, CaptureDataChangesExt, LimboError};
 use crate::{
@@ -833,15 +833,11 @@ fn emit_index_column_value_from_cursor(
         // Set up SelfTableContext for any SELF_TABLE references in the expression
         // (virtual column expressions pre-resolved at schema time).
         let joined = table_references.joined_tables().first();
-        let self_table_context = if let Some(jt) = joined {
-            Some(crate::vdbe::builder::SelfTableContext::ForSelect {
+        let self_table_context = joined.map(|jt| SelfTableContext::ForSelect {
                 table_ref_id: jt.internal_id,
                 referenced_tables: table_references.clone(),
-            })
-        } else {
-            None
-        };
-        program.with_self_table_context(self_table_context, |program| {
+            });
+        program.with_self_table_context(self_table_context.as_ref(), |program, _| {
             translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
             Ok(())
         })?;

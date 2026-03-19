@@ -2963,70 +2963,72 @@ pub fn translate_expr(
             is_rowid_alias,
         } if table_ref_id.is_self_table() => {
             // Take the context out to avoid borrow conflict with `program`.
-            let ctx = program.self_table_context.take();
-            match ctx {
-                Some(SelfTableContext::ForSelect {
-                    table_ref_id: real_id,
-                    ref referenced_tables,
-                }) => {
-                    let real_col = ast::Expr::Column {
-                        database: None,
-                        table: real_id,
-                        column: *column,
-                        is_rowid_alias: *is_rowid_alias,
-                    };
-                    // Restore context before recursive call (nested virtual cols may need it)
-                    program.self_table_context = Some(SelfTableContext::ForSelect {
+            return program.with_existing_self_table_context(|program, self_table_context| {
+                match self_table_context {
+                    Some(SelfTableContext::ForSelect {
                         table_ref_id: real_id,
-                        referenced_tables: referenced_tables.clone(),
-                    });
-                    return translate_expr(
-                        program,
-                        Some(referenced_tables),
-                        &real_col,
-                        target_register,
-                        resolver,
-                    );
-                }
-                Some(SelfTableContext::ForDML {
-                    ref column_regs,
-                    ref columns,
-                }) => {
-                    // Check if the referenced column is itself a virtual column
-                    let is_virtual = columns.get(*column).and_then(|col| {
-                        if let GeneratedType::Virtual(gen_expr) = col.generated_type() {
-                            Some((gen_expr.clone(), col.affinity()))
-                        } else {
-                            None
-                        }
-                    });
-                    if let Some((gen_expr, affinity)) = is_virtual {
-                        // Restore context before recursive eval
-                        program.self_table_context = ctx;
-                        translate_expr(program, None, &gen_expr, target_register, resolver)?;
-                        program.emit_insn(Insn::Affinity {
-                            start_reg: target_register,
-                            count: std::num::NonZeroUsize::MIN,
-                            affinities: affinity.aff_mask().to_string(),
-                        });
-                        return Ok(target_register);
+                        ref referenced_tables,
+                    }) => {
+                        let real_col = ast::Expr::Column {
+                            database: None,
+                            table: *real_id,
+                            column: *column,
+                            is_rowid_alias: *is_rowid_alias,
+                        };
+
+                        program.with_self_table_context(
+                            Some(&SelfTableContext::ForSelect {
+                                table_ref_id: *real_id,
+                                referenced_tables: referenced_tables.clone(),
+                            }),
+                            |program, _| {
+                                translate_expr(
+                                    program,
+                                    Some(referenced_tables),
+                                    &real_col,
+                                    target_register,
+                                    resolver,
+                                )
+                            },
+                        )
                     }
-                    // Non-virtual column: copy from register
-                    let src_reg = column_regs[*column];
-                    program.self_table_context = ctx;
-                    program.emit_insn(Insn::Copy {
-                        src_reg,
-                        dst_reg: target_register,
-                        extra_amount: 0,
-                    });
-                    return Ok(target_register);
+                    Some(SelfTableContext::ForDML {
+                        ref column_regs,
+                        ref columns,
+                    }) => {
+                        // Check if the referenced column is itself a virtual column
+                        let is_virtual = columns.get(*column).and_then(|col| {
+                            if let GeneratedType::Virtual(gen_expr) = col.generated_type() {
+                                Some((gen_expr.clone(), col.affinity()))
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some((gen_expr, affinity)) = is_virtual {
+                            translate_expr(program, None, &gen_expr, target_register, resolver)?;
+                            program.emit_insn(Insn::Affinity {
+                                start_reg: target_register,
+                                count: std::num::NonZeroUsize::MIN,
+                                affinities: affinity.aff_mask().to_string(),
+                            });
+                            return Ok(target_register);
+                        }
+                        // Non-virtual column: copy from register
+                        let src_reg = column_regs[*column];
+                        program.emit_insn(Insn::Copy {
+                            src_reg,
+                            dst_reg: target_register,
+                            extra_amount: 0,
+                        });
+                        Ok(target_register)
+                    }
+                    None => {
+                        crate::bail_parse_error!(
+                            "SELF_TABLE column reference outside of generated column context"
+                        );
+                    }
                 }
-                None => {
-                    crate::bail_parse_error!(
-                        "SELF_TABLE column reference outside of generated column context"
-                    );
-                }
-            }
+            });
         }
         ast::Expr::Column {
             database: _,
@@ -3201,16 +3203,21 @@ pub fn translate_expr(
 
                                 // Set up SelfTableContext so that Expr::Column { SELF_TABLE }
                                 // in the generated expression remaps to the real table reference.
-                                program.self_table_context = Some(SelfTableContext::ForSelect {
-                                    table_ref_id: *table_ref_id,
-                                    referenced_tables: referenced_tables.unwrap().clone(),
-                                });
-                                translate_expr(
-                                    program,
-                                    referenced_tables,
-                                    expr,
-                                    target_register,
-                                    resolver,
+                                program.with_self_table_context(
+                                    Some(&SelfTableContext::ForSelect {
+                                        table_ref_id: *table_ref_id,
+                                        referenced_tables: referenced_tables.unwrap().clone(),
+                                    }),
+                                    |program, _| {
+                                        translate_expr(
+                                            program,
+                                            referenced_tables,
+                                            expr,
+                                            target_register,
+                                            resolver,
+                                        )?;
+                                        Ok(())
+                                    },
                                 )?;
 
                                 // Apply the VIRTUAL column's declared affinity to the

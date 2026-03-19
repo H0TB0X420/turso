@@ -2669,8 +2669,8 @@ pub fn compute_virtual_columns_for_triggers<'a>(
             let expr = expr.as_ref().clone();
 
             program.with_self_table_context(
-                Some(self_table_ctx_from_col_mappings(col_mappings, rowid_alias)),
-                |program| {
+                Some(&self_table_ctx_from_col_mappings(col_mappings, rowid_alias)),
+                |program, _| {
                     translate_expr(program, None, &expr, col_mapping.register, resolver)?;
                     Ok(())
                 },
@@ -3368,13 +3368,16 @@ fn emit_index_column_value_for_insert(
             .collect();
         schema::resolve_gencol_names(&mut expr, &columns)?;
 
-        program.with_self_table_context(Some(self_table_ctx_from_col_mappings(
-            &insertion.col_mappings,
-            insertion.rowid_alias_mapping(),
-        )), |program| {
-        translate_expr(program, None, &expr, dest_reg, resolver)?;
-            Ok(())
-        })?;
+        program.with_self_table_context(
+            Some(&self_table_ctx_from_col_mappings(
+                &insertion.col_mappings,
+                insertion.rowid_alias_mapping(),
+            )),
+            |program, _| {
+                translate_expr(program, None, &expr, dest_reg, resolver)?;
+                Ok(())
+            },
+        )?;
 
         // Apply column affinity for VIRTUAL columns.
         if let Some(affinity) = &idx_col.affinity {

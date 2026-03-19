@@ -1,3 +1,4 @@
+use crate::vdbe::builder::SelfTableContext;
 use crate::{
     schema::{Index, Schema, Table},
     translate::{
@@ -404,26 +405,25 @@ fn translate_integrity_check_impl(
                     }
                     BoundIndexColumn::Expr(expr) => {
                         let self_table_context =
-                            if let Some(jt) = table_references.joined_tables().first() {
-                                Some(crate::vdbe::builder::SelfTableContext::ForSelect {
+                            table_references.joined_tables().first().map(|jt| SelfTableContext::ForSelect {
                                     table_ref_id: jt.internal_id,
                                     referenced_tables: table_references.clone(),
-                                })
-                            } else {
-                                None
-                            };
+                                });
 
-                        program.with_self_table_context(self_table_context, |program| {
-                            translate_expr_no_constant_opt(
-                                program,
-                                Some(&table_references),
-                                expr,
-                                target,
-                                resolver,
-                                NoConstantOptReason::RegisterReuse,
-                            )?;
-                            Ok(())
-                        })?
+                        program.with_self_table_context(
+                            self_table_context.as_ref(),
+                            |program, _| {
+                                translate_expr_no_constant_opt(
+                                    program,
+                                    Some(&table_references),
+                                    expr,
+                                    target,
+                                    resolver,
+                                    NoConstantOptReason::RegisterReuse,
+                                )?;
+                                Ok(())
+                            },
+                        )?
                     }
                 }
             }

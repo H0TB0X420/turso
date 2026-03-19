@@ -423,11 +423,11 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                 {
                     Some(GeneratedType::Virtual(expr)) => {
                         planner.program.with_self_table_context(
-                            Some(SelfTableContext::ForSelect {
+                            Some(&SelfTableContext::ForSelect {
                                 table_ref_id: build_table.internal_id,
                                 referenced_tables: planner.table_references.clone(),
                             }),
-                            |program| -> Result<()> {
+                            |program, _| -> Result<()> {
                                 translate_expr(
                                     program,
                                     Some(planner.table_references),

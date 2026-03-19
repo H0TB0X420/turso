@@ -326,8 +326,7 @@ pub enum Stmt {
 pub struct TableInternalId(usize);
 
 impl TableInternalId {
-    /// Sentinel used in generated column expressions to mean "a column of the
-    /// table that owns this generated column." Resolved at schema load time.
+    /// used in generated columns to signify "the table that the column belongs to"
     pub const SELF_TABLE: Self = Self(0);
 
     pub fn is_self_table(&self) -> bool {
