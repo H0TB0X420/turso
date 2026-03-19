@@ -111,11 +111,11 @@ fn translate_between_expr(
 }
 
 fn build_between_terms(
-    lhs: Expr,
+    lhs: ast::Expr,
     not: bool,
-    start: Expr,
-    end: Expr,
-) -> (Expr, Expr, ast::Operator) {
+    start: ast::Expr,
+    end: ast::Expr,
+) -> (ast::Expr, ast::Expr, ast::Operator) {
     let (lower_op, upper_op, combine_op) = if not {
         (
             ast::Operator::Less,
@@ -129,8 +129,8 @@ fn build_between_terms(
             ast::Operator::And,
         )
     };
-    let lower_expr = Expr::Binary(Box::new(lhs.clone()), lower_op, Box::new(start));
-    let upper_expr = Expr::Binary(Box::new(lhs), upper_op, Box::new(end));
+    let lower_expr = ast::Expr::Binary(Box::new(lhs.clone()), lower_op, Box::new(start));
+    let upper_expr = ast::Expr::Binary(Box::new(lhs), upper_op, Box::new(end));
     (lower_expr, upper_expr, combine_op)
 }
 
@@ -2968,27 +2968,18 @@ pub fn translate_expr(
                         table_ref_id: real_id,
                         ref referenced_tables,
                     }) => {
-                        let real_col = ast::Expr::Column {
+                        let real_col = Expr::Column {
                             database: None,
                             table: *real_id,
                             column: *column,
                             is_rowid_alias: *is_rowid_alias,
                         };
-
-                        program.with_self_table_context(
-                            Some(&SelfTableContext::ForSelect {
-                                table_ref_id: *real_id,
-                                referenced_tables: referenced_tables.clone(),
-                            }),
-                            |program, _| {
-                                translate_expr(
-                                    program,
-                                    Some(referenced_tables),
-                                    &real_col,
-                                    target_register,
-                                    resolver,
-                                )
-                            },
+                        translate_expr(
+                            program,
+                            Some(referenced_tables),
+                            &real_col,
+                            target_register,
+                            resolver,
                         )
                     }
                     Some(SelfTableContext::ForDML {
