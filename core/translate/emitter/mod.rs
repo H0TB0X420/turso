@@ -1409,12 +1409,14 @@ pub(crate) fn emit_index_column_value_old_image(
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
 
-        //TODO will this work if right_join_swapped is true?
-        let joined = table_references.joined_tables().first();
-        let self_table_context = joined.map(|jt| SelfTableContext::ForSelect {
-                table_ref_id: jt.internal_id,
-                referenced_tables: table_references.clone(),
-            });
+        let self_table_context =
+            table_references
+                .joined_tables()
+                .first()
+                .map(|jt| SelfTableContext::ForSelect {
+                    table_ref_id: jt.internal_id,
+                    referenced_tables: table_references.clone(),
+                });
         program.with_self_table_context(self_table_context.as_ref(), |program, _| {
             translate_expr_no_constant_opt(
                 program,

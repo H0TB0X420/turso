@@ -824,13 +824,14 @@ fn emit_index_column_value_from_cursor(
             resolver,
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
-        // Set up SelfTableContext for any SELF_TABLE references in the expression
-        // (virtual column expressions pre-resolved at schema time).
-        let joined = table_references.joined_tables().first();
-        let self_table_context = joined.map(|jt| SelfTableContext::ForSelect {
-            table_ref_id: jt.internal_id,
-            referenced_tables: table_references.clone(),
-        });
+        let self_table_context =
+            table_references
+                .joined_tables()
+                .first()
+                .map(|jt| SelfTableContext::ForSelect {
+                    table_ref_id: jt.internal_id,
+                    referenced_tables: table_references.clone(),
+                });
         program.with_self_table_context(self_table_context.as_ref(), |program, _| {
             translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
             Ok(())

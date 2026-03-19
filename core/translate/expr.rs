@@ -3263,10 +3263,11 @@ pub fn translate_expr(
                         // we already applied affinity for these.
                         let virtual_already_applied =
                             table_column.is_virtual_generated() && !read_from_index;
-                        if !(virtual_already_applied || resolver
-                            .schema()
-                            .get_type_def(&column.ty_str, table.is_strict())
-                            .is_some())
+                        if !(virtual_already_applied
+                            || resolver
+                                .schema()
+                                .get_type_def(&column.ty_str, table.is_strict())
+                                .is_some())
                         {
                             maybe_apply_affinity(column.ty(), target_register, program);
                         }

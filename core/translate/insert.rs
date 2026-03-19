@@ -470,8 +470,6 @@ pub fn translate_insert(
 
     let has_before_triggers = !relevant_before_triggers.is_empty();
     if has_before_triggers {
-        // Compute VIRTUAL column values for trigger access
-        // VIRTUAL columns are normally NULL (computed on read), but triggers need actual values
         compute_virtual_columns_for_triggers(
             program,
             &insertion.col_mappings,
@@ -797,10 +795,8 @@ pub fn translate_insert(
         connection,
         table_references: &mut table_references,
     };
-    // Compute VIRTUAL column values before NOT NULL constraint checking.
-    // VIRTUAL columns normally store NULL (computed on read), but NOT NULL checks
-    // need the actual computed values to correctly validate constraints like:
-    //   b AS (COALESCE(a, 0)) NOT NULL  -- should pass even when a is NULL
+    // Compute virtual column values before NOT NULL constraint checking,
+    // so that things like b AS (COALESCE(a, 0)) NOT NULL` pass validation.
     if insertion.has_virtual_columns() {
         compute_virtual_columns_for_triggers(
             program,
@@ -825,7 +821,6 @@ pub fn translate_insert(
     )?;
 
     // Create and insert the record
-    // VIRTUAL generated columns are not stored, so we need to exclude them from the record.
     emit_make_record_without_virtual_columns(
         program,
         insertion
@@ -897,8 +892,6 @@ pub fn translate_insert(
     });
     let has_after_triggers = !relevant_after_triggers.is_empty();
     if has_after_triggers {
-        // Compute VIRTUAL column values for trigger access
-        // VIRTUAL columns are normally NULL (computed on read), but triggers need actual values
         compute_virtual_columns_for_triggers(
             program,
             &insertion.col_mappings,
@@ -1770,9 +1763,8 @@ fn bind_insert(
     let mut inserting_multiple_rows = false;
     match body {
         InsertBody::DefaultValues => {
-            // Generate default values for the table.
+            // Generate default values for the table, skipping generated columns.
             // Check column-level default first, then type-level default.
-            // Generated columns are excluded - they are computed from their expressions
             let is_strict = table.is_strict();
             values = table
                 .columns()
@@ -1928,9 +1920,7 @@ fn init_source_emission<'a>(
     database_id: usize,
 ) -> Result<()> {
     let required_column_count = if columns.is_empty() {
-        // When no column list is specified, count only insertable columns
-        // (excludes generated columns which are computed, not inserted)
-        table.columns().iter().filter(|c| !c.is_generated()).count()
+        table.columns().iter().filter(|c| c.is_storable()).count()
     } else {
         columns.len()
     };
@@ -2124,13 +2114,8 @@ fn init_source_emission<'a>(
             }
         }
         InsertBody::DefaultValues => {
-            // Only count and process non-generated columns
-            // Generated columns are computed from their expressions, not default values
-            let insertable_columns: Vec<_> = table
-                .columns()
-                .iter()
-                .filter(|c| !c.is_generated())
-                .collect();
+            let insertable_columns: Vec<_> =
+                table.columns().iter().filter(|c| c.is_storable()).collect();
             let num_values = insertable_columns.len();
             let is_strict = table.is_strict();
             values.extend(insertable_columns.iter().map(|c| {
@@ -2217,8 +2202,7 @@ impl<'a> Insertion<'a> {
         self.record_reg
     }
 
-    /// Returns true if any column is a VIRTUAL generated column.
-    pub fn has_virtual_columns(&self) -> bool {
+    fn has_virtual_columns(&self) -> bool {
         self.col_mappings
             .iter()
             .any(|m| m.column.is_virtual_generated())
@@ -2247,10 +2231,7 @@ impl<'a> Insertion<'a> {
         })
     }
 
-    /// Returns the rowid alias column mapping if the key is a RowidAlias.
-    /// Used by generated column expression translation to resolve references
-    /// to INTEGER PRIMARY KEY columns.
-    pub fn rowid_alias_mapping(&self) -> Option<&ColMapping<'a>> {
+    fn rowid_alias_mapping(&self) -> Option<&ColMapping<'a>> {
         match &self.key {
             InsertionKey::RowidAlias(mapping) => Some(mapping),
             _ => None,
@@ -2340,10 +2321,9 @@ fn build_insertion<'a>(
 
     if columns.is_empty() {
         // Case 1: No columns specified - map values to columns in order
-        // Generated and hidden columns are not taken into account for value count
         let insertable_count = table_columns
             .iter()
-            .filter(|c| !c.hidden() && !c.is_generated())
+            .filter(|c| !c.hidden() && c.is_storable())
             .count();
         if num_values != insertable_count {
             crate::bail_parse_error!(
@@ -2504,11 +2484,7 @@ fn translate_rows_base<'short, 'long: 'short>(
         &mut translate_value_fn,
         resolver,
         is_strict,
-        &insertion.col_mappings,
     )?;
-
-    // Get the rowid alias mapping if one exists, for generated column expression translation
-    let rowid_alias = insertion.rowid_alias_mapping();
 
     for col in insertion.col_mappings.iter() {
         translate_column(
@@ -2519,8 +2495,6 @@ fn translate_rows_base<'short, 'long: 'short>(
             &mut translate_value_fn,
             resolver,
             is_strict,
-            &insertion.col_mappings,
-            rowid_alias,
         )?;
     }
 
@@ -2534,7 +2508,6 @@ fn translate_key<'a>(
     mut translate_value_fn: impl FnMut(&mut ProgramBuilder, usize, usize) -> Result<()>,
     resolver: &Resolver,
     is_strict: bool,
-    col_mappings: &[ColMapping<'a>],
 ) -> Result<()> {
     match &insertion.key {
         InsertionKey::RowidAlias(rowid_alias_column) => translate_column(
@@ -2545,8 +2518,6 @@ fn translate_key<'a>(
             &mut translate_value_fn,
             resolver,
             is_strict,
-            col_mappings,
-            None, // Key translation doesn't need rowid alias resolution
         ),
         InsertionKey::LiteralRowid {
             value_index,
@@ -2559,8 +2530,6 @@ fn translate_key<'a>(
             &mut translate_value_fn,
             resolver,
             is_strict,
-            col_mappings,
-            None, // Key translation doesn't need rowid alias resolution
         ),
         InsertionKey::Autogenerated { .. } => Ok(()), // will be populated later
     }
@@ -2575,8 +2544,6 @@ fn translate_column<'a>(
     translate_value_fn: &mut impl FnMut(&mut ProgramBuilder, usize, usize) -> Result<()>,
     resolver: &Resolver,
     is_strict: bool,
-    _col_mappings: &[ColMapping<'a>],
-    _rowid_alias: Option<&ColMapping<'a>>,
 ) -> Result<()> {
     if let Some(value_index) = value_index {
         translate_value_fn(program, value_index, column_register)?;
@@ -3378,7 +3345,6 @@ fn emit_index_column_value_for_insert(
                 Ok(())
             },
         )?;
-
     } else {
         let Some(cm) = insertion.get_col_mapping_by_name(&idx_col.name) else {
             return Err(LimboError::PlanningError(

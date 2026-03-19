@@ -3656,9 +3656,9 @@ impl Column {
 
     /// Returns an error if this column is a generated column.
     /// `verb_phrase` should describe the operation, e.g. "INSERT into" or "UPDATE".
-    pub fn ensure_not_generated(&self, verb_phrase: &str, col_name: &str) -> crate::Result<()> {
+    pub fn ensure_not_generated(&self, verb_phrase: &str, col_name: &str) -> Result<()> {
         if !matches!(self.generated_type, GeneratedType::NotGenerated) {
-            crate::bail_parse_error!("cannot {} generated column \"{}\"", verb_phrase, col_name);
+            bail_parse_error!("cannot {} generated column \"{}\"", verb_phrase, col_name);
         }
         Ok(())
     }
@@ -3748,7 +3748,7 @@ impl Column {
 
     /// true if the column must be stored on disk (e.g. it's not a VIRTUAL column)
     pub fn is_storable(&self) -> bool {
-        self.generated_type.is_storable()
+        !self.is_generated()
     }
 }
 
