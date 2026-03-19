@@ -1892,18 +1892,6 @@ pub enum Table {
     FromClauseSubquery(Arc<FromClauseSubquery>),
 }
 
-//TODO
-// 1 - this needs to use normalize_ident
-// 2 - this is called way too many times, it should be cached somewhere
-/// Build a map from lowercased column names to their indices.
-pub fn build_column_name_lookup(columns: &[Column]) -> HashMap<String, usize> {
-    columns
-        .iter()
-        .enumerate()
-        .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
-        .collect()
-}
-
 impl Table {
     pub fn get_root_page(&self) -> crate::Result<i64> {
         match self {
@@ -1993,12 +1981,6 @@ impl Table {
             Self::Virtual(table) => Some(table.clone()),
             _ => None,
         }
-    }
-
-    /// Build a map from lowercased column names to their indices.
-    /// This is useful for looking up columns by name in generated column expressions.
-    pub fn column_name_to_index_map(&self) -> rustc_hash::FxHashMap<String, usize> {
-        build_column_name_lookup(self.columns())
     }
 }
 

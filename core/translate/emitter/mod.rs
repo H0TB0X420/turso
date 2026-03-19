@@ -1487,13 +1487,11 @@ fn emit_index_column_value_new_image(
             .expect("column index out of bounds");
         match col_in_table.generated_type() {
             GeneratedType::Virtual(ref expr) => {
-                let column_lookup = crate::schema::build_column_name_lookup(columns);
-                update::emit_generated_expr_from_registers(
+                update::emit_gencol_expr_from_registers(
                     program,
                     expr,
                     dest_reg,
                     columns_start_reg,
-                    &column_lookup,
                     columns,
                     resolver,
                     Some(rowid_reg),

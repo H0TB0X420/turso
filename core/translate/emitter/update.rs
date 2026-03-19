@@ -1,5 +1,5 @@
 use super::TranslateCtx;
-use crate::schema::GeneratedType;
+use crate::schema::{GeneratedType, Table};
 use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::stmt_journal::any_effective_replace;
 use crate::{
@@ -1041,6 +1041,7 @@ fn emit_update_insns<'a>(
 
     // Fire BEFORE UPDATE triggers and preserve old_registers for AFTER triggers
     let mut has_before_triggers = false;
+    let mut has_after_triggers = false;
     let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) =
         target_table.table.btree()
     {
@@ -1058,7 +1059,7 @@ fn emit_update_insns<'a>(
                 .collect()
             });
 
-        let has_after_triggers = t_ctx.resolver.with_schema(update_database_id, |s| {
+        has_after_triggers = t_ctx.resolver.with_schema(update_database_id, |s| {
             get_relevant_triggers_type_and_time(
                 s,
                 TriggerEvent::Update,
@@ -1108,8 +1109,6 @@ fn emit_update_insns<'a>(
             // use the new rowid register; otherwise use the current rowid (beg).
             let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
 
-            let column_lookup = crate::schema::build_column_name_lookup(columns);
-
             // Compute virtual columns for NEW values
             compute_virtual_columns_for_update(
                 program,
@@ -1118,7 +1117,6 @@ fn emit_update_insns<'a>(
                     registers_start: start,
                     rowid_reg: Some(beg),
                 },
-                &column_lookup,
                 &t_ctx.resolver,
             )?;
 
@@ -1127,7 +1125,6 @@ fn emit_update_insns<'a>(
                 program,
                 columns,
                 &VirtualColumnRegisters::Indexed(&old_registers),
-                &column_lookup,
                 &t_ctx.resolver,
             )?;
 
@@ -1318,21 +1315,25 @@ fn emit_update_insns<'a>(
             .register_affinities
             .insert(rowid_reg, Affinity::Integer);
     }
-    // Compute VIRTUAL generated column values into their registers.
-    // VIRTUAL columns hold NULL during UPDATE (they're not stored), but index operations
-    // need the computed values. This must happen BEFORE any index key building.
+
+    let has_virtual_columns = target_table
+        .table
+        .columns()
+        .iter()
+        .any(|c| c.is_virtual_generated());
+    if has_virtual_columns
+        && (!indexes_to_update.is_empty() || has_before_triggers || has_after_triggers)
     {
         let columns = target_table.table.columns();
-        let column_lookup = crate::schema::build_column_name_lookup(columns);
         let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
+
         for (idx, col) in columns.iter().enumerate() {
             if let GeneratedType::Virtual(expr) = col.generated_type() {
-                emit_generated_expr_from_registers(
+                emit_gencol_expr_from_registers(
                     program,
                     expr,
                     start + idx,
                     start,
-                    &column_lookup,
                     columns,
                     &t_ctx.resolver,
                     Some(rowid_reg),
@@ -2096,102 +2097,99 @@ fn emit_update_insns<'a>(
         }
     }
 
-    if target_table.table.btree().is_some() {
-        let record_reg = program.alloc_register();
-        emit_make_record_without_virtual_columns(
-            program,
-            target_table
-                .table
-                .columns()
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (start + i, c)),
-            record_reg,
-            target_table.table.btree().is_some_and(|bt| bt.is_strict),
-        );
-
-        if not_exists_check_required {
-            program.emit_insn(Insn::NotExists {
-                cursor: target_table_cursor_id,
-                rowid_reg: beg,
-                target_pc: check_rowid_not_exists_label.unwrap(),
-            });
-        }
-
-        // create alias for CDC rowid after the change (will differ from cdc_rowid_before_reg only in case of UPDATE with change in rowid alias)
-        let cdc_rowid_after_reg = rowid_set_clause_reg.unwrap_or(beg);
-
-        // create separate register with rowid before UPDATE for CDC
-        let cdc_rowid_before_reg = if t_ctx.cdc_cursor_id.is_some() {
-            let cdc_rowid_before_reg = program.alloc_register();
-            if has_user_provided_rowid {
-                program.emit_insn(Insn::RowId {
-                    cursor_id: target_table_cursor_id,
-                    dest: cdc_rowid_before_reg,
-                });
-                Some(cdc_rowid_before_reg)
-            } else {
-                Some(cdc_rowid_after_reg)
-            }
-        } else {
-            None
-        };
-
-        // create full CDC record before update if necessary
-        let cdc_before_reg = if program.capture_data_changes_info().has_before() {
-            Some(emit_cdc_full_record(
+    match &target_table.table {
+        Table::BTree(ref table) => {
+            let record_reg = program.alloc_register();
+            emit_make_record_without_virtual_columns(
                 program,
-                target_table.table.columns(),
-                target_table_cursor_id,
-                cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set"),
                 target_table
                     .table
-                    .btree()
-                    .is_some_and(|btree| btree.is_strict),
-            ))
-        } else {
-            None
-        };
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (start + i, c)),
+                record_reg,
+                table.is_strict,
+            );
 
-        // If we are updating the rowid, we cannot rely on overwrite on the
-        // Insert instruction to update the cell. We need to first delete the current cell
-        // and later insert the updated record.
-        // In MVCC mode, we also need DELETE+INSERT to properly version the row (Hekaton model).
-        let needs_delete = not_exists_check_required || connection.mvcc_enabled();
-        if needs_delete {
-            program.emit_insn(Insn::Delete {
-                cursor_id: target_table_cursor_id,
-                table_name: table_name.to_string(),
-                is_part_of_update: true,
-            });
-        }
+            if not_exists_check_required {
+                program.emit_insn(Insn::NotExists {
+                    cursor: target_table_cursor_id,
+                    rowid_reg: beg,
+                    target_pc: check_rowid_not_exists_label.unwrap(),
+                });
+            }
 
-        program.emit_insn(Insn::Insert {
-            cursor: target_table_cursor_id,
-            key_reg: rowid_set_clause_reg.unwrap_or(beg),
-            record_reg,
-            flag: if not_exists_check_required {
-                // The previous Insn::NotExists and Insn::Delete seek to the old rowid,
-                // so to insert a new user-provided rowid, we need to seek to the correct place.
-                InsertFlags::new()
-                    .require_seek()
-                    .update_rowid_change()
-                    .skip_last_rowid()
+            // create alias for CDC rowid after the change (will differ from cdc_rowid_before_reg only in case of UPDATE with change in rowid alias)
+            let cdc_rowid_after_reg = rowid_set_clause_reg.unwrap_or(beg);
+
+            // create separate register with rowid before UPDATE for CDC
+            let cdc_rowid_before_reg = if t_ctx.cdc_cursor_id.is_some() {
+                let cdc_rowid_before_reg = program.alloc_register();
+                if has_user_provided_rowid {
+                    program.emit_insn(Insn::RowId {
+                        cursor_id: target_table_cursor_id,
+                        dest: cdc_rowid_before_reg,
+                    });
+                    Some(cdc_rowid_before_reg)
+                } else {
+                    Some(cdc_rowid_after_reg)
+                }
             } else {
-                InsertFlags::new().skip_last_rowid()
-            },
-            table_name: target_table.identifier.clone(),
-        });
+                None
+            };
 
-        // Reconcile deferred FK violations after REPLACE.
-        // If Phase 1 REPLACE deleted a parent row referenced by deferred FK children,
-        // the counter was incremented. Now that the new row is inserted with the
-        // (potentially same) parent key, scan children and decrement.
-        if connection.foreign_keys_enabled() {
-            if let Some(table_btree) = target_table.table.btree() {
+            // create full CDC record before update if necessary
+            let cdc_before_reg = if program.capture_data_changes_info().has_before() {
+                Some(emit_cdc_full_record(
+                    program,
+                    target_table.table.columns(),
+                    target_table_cursor_id,
+                    cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set"),
+                    table.is_strict,
+                ))
+            } else {
+                None
+            };
+
+            // If we are updating the rowid, we cannot rely on overwrite on the
+            // Insert instruction to update the cell. We need to first delete the current cell
+            // and later insert the updated record.
+            // In MVCC mode, we also need DELETE+INSERT to properly version the row (Hekaton model).
+            let needs_delete = not_exists_check_required || connection.mvcc_enabled();
+            if needs_delete {
+                program.emit_insn(Insn::Delete {
+                    cursor_id: target_table_cursor_id,
+                    table_name: table_name.to_string(),
+                    is_part_of_update: true,
+                });
+            }
+
+            program.emit_insn(Insn::Insert {
+                cursor: target_table_cursor_id,
+                key_reg: rowid_set_clause_reg.unwrap_or(beg),
+                record_reg,
+                flag: if not_exists_check_required {
+                    // The previous Insn::NotExists and Insn::Delete seek to the old rowid,
+                    // so to insert a new user-provided rowid, we need to seek to the correct place.
+                    InsertFlags::new()
+                        .require_seek()
+                        .update_rowid_change()
+                        .skip_last_rowid()
+                } else {
+                    InsertFlags::new().skip_last_rowid()
+                },
+                table_name: target_table.identifier.clone(),
+            });
+
+            // Reconcile deferred FK violations after REPLACE.
+            // If Phase 1 REPLACE deleted a parent row referenced by deferred FK children,
+            // the counter was incremented. Now that the new row is inserted with the
+            // (potentially same) parent key, scan children and decrement.
+            if connection.foreign_keys_enabled() {
                 emit_fk_parent_new_key_reconcile(
                     program,
-                    &table_btree,
+                    &table,
                     start,
                     rowid_set_clause_reg.unwrap_or(beg),
                     set_clauses,
@@ -2199,263 +2197,263 @@ fn emit_update_insns<'a>(
                     &t_ctx.resolver,
                 )?;
             }
-        }
 
-        // Fire FK CASCADE/SET NULL actions AFTER the parent row is updated
-        // This ensures the new parent key exists when cascade actions update child rows
-        if connection.foreign_keys_enabled()
-            && t_ctx.resolver.with_schema(update_database_id, |s| {
-                s.any_resolved_fks_referencing(table_name)
-            })
-        {
-            let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
-            // OLD column values are stored in preserved_old_registers (contiguous registers)
-            let old_values_start = preserved_old_registers
-                .as_ref()
-                .expect("FK check requires OLD values")[0];
-            fire_fk_update_actions(
-                program,
-                &mut t_ctx.resolver,
-                table_name,
-                beg, // old_rowid_reg
-                old_values_start,
-                start, // new_values_start
-                new_rowid_reg,
-                connection,
-                update_database_id,
-            )?;
-        }
-
-        // Fire AFTER UPDATE triggers
-        if let Some(btree_table) = target_table.table.btree() {
-            let updated_column_indices: HashSet<usize> =
-                set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
-            let relevant_triggers: Vec<_> = t_ctx.resolver.with_schema(update_database_id, |s| {
-                get_relevant_triggers_type_and_time(
-                    s,
-                    TriggerEvent::Update,
-                    TriggerTime::After,
-                    Some(updated_column_indices),
-                    &btree_table,
-                )
-                .collect()
-            });
-            if !relevant_triggers.is_empty() {
-                // Compute VIRTUAL column values for trigger access
-                // VIRTUAL columns are normally NULL (computed on read), but triggers need actual values
-                let columns = target_table.table.columns();
-                let column_lookup = crate::schema::build_column_name_lookup(columns);
-
-                // Compute VIRTUAL columns for NEW values
-                compute_virtual_columns_for_update(
+            // Fire FK CASCADE/SET NULL actions AFTER the parent row is updated
+            // This ensures the new parent key exists when cascade actions update child rows
+            if connection.foreign_keys_enabled()
+                && t_ctx.resolver.with_schema(update_database_id, |s| {
+                    s.any_resolved_fks_referencing(table_name)
+                })
+            {
+                let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
+                // OLD column values are stored in preserved_old_registers (contiguous registers)
+                let old_values_start = preserved_old_registers
+                    .as_ref()
+                    .expect("FK check requires OLD values")[0];
+                fire_fk_update_actions(
                     program,
-                    columns,
-                    &VirtualColumnRegisters::Contiguous {
-                        registers_start: start,
-                        rowid_reg: Some(beg),
-                    },
-                    &column_lookup,
-                    &t_ctx.resolver,
+                    &mut t_ctx.resolver,
+                    table_name,
+                    beg, // old_rowid_reg
+                    old_values_start,
+                    start, // new_values_start
+                    new_rowid_reg,
+                    connection,
+                    update_database_id,
                 )?;
+            }
 
-                // Compute VIRTUAL columns for OLD values if we have preserved OLD registers
-                if let Some(ref old_regs) = preserved_old_registers {
+            // Fire AFTER UPDATE triggers
+            if let Some(btree_table) = target_table.table.btree() {
+                let updated_column_indices: HashSet<usize> =
+                    set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
+                let relevant_triggers: Vec<_> =
+                    t_ctx.resolver.with_schema(update_database_id, |s| {
+                        get_relevant_triggers_type_and_time(
+                            s,
+                            TriggerEvent::Update,
+                            TriggerTime::After,
+                            Some(updated_column_indices),
+                            &btree_table,
+                        )
+                        .collect()
+                    });
+                if !relevant_triggers.is_empty() {
+                    // Compute VIRTUAL column values for trigger access
+                    // VIRTUAL columns are normally NULL (computed on read), but triggers need actual values
+                    let columns = target_table.table.columns();
+
+                    // Compute VIRTUAL columns for NEW values
                     compute_virtual_columns_for_update(
                         program,
                         columns,
-                        &VirtualColumnRegisters::Indexed(old_regs),
-                        &column_lookup,
+                        &VirtualColumnRegisters::Contiguous {
+                            registers_start: start,
+                            rowid_reg: Some(beg),
+                        },
                         &t_ctx.resolver,
                     )?;
+
+                    // Compute VIRTUAL columns for OLD values if we have preserved OLD registers
+                    if let Some(ref old_regs) = preserved_old_registers {
+                        compute_virtual_columns_for_update(
+                            program,
+                            columns,
+                            &VirtualColumnRegisters::Indexed(old_regs),
+                            &t_ctx.resolver,
+                        )?;
+                    }
+
+                    let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
+                    // Build raw NEW registers. Values are encoded at this point;
+                    // fire_trigger will decode them via decode_trigger_registers.
+                    let new_registers_after: Vec<usize> = (0..col_len)
+                        .map(|i| start + i)
+                        .chain(std::iter::once(new_rowid_reg))
+                        .collect();
+
+                    // Use preserved OLD registers from BEFORE trigger
+                    let old_registers_after = preserved_old_registers;
+
+                    // Propagate conflict resolution to AFTER trigger context (same logic as BEFORE)
+                    let trigger_ctx_after =
+                        if let Some(override_conflict) = program.trigger_conflict_override {
+                            TriggerContext::new_after_with_override_conflict(
+                                btree_table,
+                                Some(new_registers_after),
+                                old_registers_after, // OLD values preserved from BEFORE trigger
+                                override_conflict,
+                            )
+                        } else if !matches!(or_conflict, ResolveType::Abort) {
+                            TriggerContext::new_after_with_override_conflict(
+                                btree_table,
+                                Some(new_registers_after),
+                                old_registers_after,
+                                or_conflict,
+                            )
+                        } else {
+                            TriggerContext::new_after(
+                                btree_table,
+                                Some(new_registers_after),
+                                old_registers_after, // OLD values preserved from BEFORE trigger
+                            )
+                        };
+
+                    // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
+                    // not skip post-row work (RETURNING, CDC).
+                    let after_trigger_done = program.allocate_label();
+                    for trigger in relevant_triggers {
+                        fire_trigger(
+                            program,
+                            &mut t_ctx.resolver,
+                            trigger,
+                            &trigger_ctx_after,
+                            connection,
+                            update_database_id,
+                            after_trigger_done,
+                        )?;
+                    }
+                    program.preassign_label_to_next_insn(after_trigger_done);
                 }
-
-                let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
-                // Build raw NEW registers. Values are encoded at this point;
-                // fire_trigger will decode them via decode_trigger_registers.
-                let new_registers_after: Vec<usize> = (0..col_len)
-                    .map(|i| start + i)
-                    .chain(std::iter::once(new_rowid_reg))
-                    .collect();
-
-                // Use preserved OLD registers from BEFORE trigger
-                let old_registers_after = preserved_old_registers;
-
-                // Propagate conflict resolution to AFTER trigger context (same logic as BEFORE)
-                let trigger_ctx_after =
-                    if let Some(override_conflict) = program.trigger_conflict_override {
-                        TriggerContext::new_after_with_override_conflict(
-                            btree_table,
-                            Some(new_registers_after),
-                            old_registers_after, // OLD values preserved from BEFORE trigger
-                            override_conflict,
-                        )
-                    } else if !matches!(or_conflict, ResolveType::Abort) {
-                        TriggerContext::new_after_with_override_conflict(
-                            btree_table,
-                            Some(new_registers_after),
-                            old_registers_after,
-                            or_conflict,
-                        )
-                    } else {
-                        TriggerContext::new_after(
-                            btree_table,
-                            Some(new_registers_after),
-                            old_registers_after, // OLD values preserved from BEFORE trigger
-                        )
-                    };
-
-                // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
-                // not skip post-row work (RETURNING, CDC).
-                let after_trigger_done = program.allocate_label();
-                for trigger in relevant_triggers {
-                    fire_trigger(
-                        program,
-                        &mut t_ctx.resolver,
-                        trigger,
-                        &trigger_ctx_after,
-                        connection,
-                        update_database_id,
-                        after_trigger_done,
-                    )?;
-                }
-                program.preassign_label_to_next_insn(after_trigger_done);
             }
-        }
 
-        let has_post_write_returning_subqueries = non_from_clause_subqueries
-            .iter()
-            .any(|s| !s.has_been_evaluated() && s.is_post_write_returning());
-        if has_post_write_returning_subqueries {
-            let cache_state = seed_returning_row_image_in_cache(
-                program,
-                table_references,
-                start,
-                rowid_set_clause_reg.unwrap_or(beg),
-                &mut t_ctx.resolver,
-            )?;
-            let result: Result<()> = (|| {
-                // Emit RETURNING subqueries after Insert so correlated references
-                // resolve against the post-write row image, not the old cursor state.
-                for subquery in non_from_clause_subqueries
-                    .iter_mut()
-                    .filter(|s| !s.has_been_evaluated() && s.is_post_write_returning())
-                {
-                    let rerun_for_target_scan = subquery
-                        .reads_table(target_table.database_id, target_table.table.get_name());
-                    let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
-                    emit_non_from_clause_subquery(
-                        program,
-                        &t_ctx.resolver,
-                        *subquery_plan,
-                        &subquery.query_type,
-                        subquery.correlated || rerun_for_target_scan,
-                        true,
-                    )?;
-                }
-                Ok(())
-            })();
-            restore_returning_row_image_in_cache(&mut t_ctx.resolver, cache_state);
-            result?;
-        }
-
-        // Emit RETURNING results if specified
-        if let Some(returning_columns) = &returning {
-            if !returning_columns.is_empty() {
-                emit_returning_results(
+            let has_post_write_returning_subqueries = non_from_clause_subqueries
+                .iter()
+                .any(|s| !s.has_been_evaluated() && s.is_post_write_returning());
+            if has_post_write_returning_subqueries {
+                let cache_state = seed_returning_row_image_in_cache(
                     program,
                     table_references,
-                    returning_columns,
                     start,
                     rowid_set_clause_reg.unwrap_or(beg),
                     &mut t_ctx.resolver,
-                    returning_buffer,
                 )?;
+                let result: Result<()> = (|| {
+                    // Emit RETURNING subqueries after Insert so correlated references
+                    // resolve against the post-write row image, not the old cursor state.
+                    for subquery in non_from_clause_subqueries
+                        .iter_mut()
+                        .filter(|s| !s.has_been_evaluated() && s.is_post_write_returning())
+                    {
+                        let rerun_for_target_scan = subquery
+                            .reads_table(target_table.database_id, target_table.table.get_name());
+                        let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
+                        emit_non_from_clause_subquery(
+                            program,
+                            &t_ctx.resolver,
+                            *subquery_plan,
+                            &subquery.query_type,
+                            subquery.correlated || rerun_for_target_scan,
+                            true,
+                        )?;
+                    }
+                    Ok(())
+                })();
+                restore_returning_row_image_in_cache(&mut t_ctx.resolver, cache_state);
+                result?;
             }
-        }
 
-        // create full CDC record after update if necessary
-        let cdc_after_reg = if program.capture_data_changes_info().has_after() {
-            Some(emit_cdc_patch_record(
-                program,
-                &target_table.table,
-                start,
-                record_reg,
-                cdc_rowid_after_reg,
-            ))
-        } else {
-            None
-        };
+            // Emit RETURNING results if specified
+            if let Some(returning_columns) = &returning {
+                if !returning_columns.is_empty() {
+                    emit_returning_results(
+                        program,
+                        table_references,
+                        returning_columns,
+                        start,
+                        rowid_set_clause_reg.unwrap_or(beg),
+                        &mut t_ctx.resolver,
+                        returning_buffer,
+                    )?;
+                }
+            }
 
-        let cdc_updates_record = if let Some(cdc_updates_register) = cdc_updates_register {
-            let record_reg = program.alloc_register();
-            program.emit_insn(Insn::MakeRecord {
-                start_reg: to_u16(cdc_updates_register),
-                count: to_u16(2 * col_len),
-                dest_reg: to_u16(record_reg),
-                index_name: None,
-                affinity_str: None,
-            });
-            Some(record_reg)
-        } else {
-            None
-        };
-
-        // emit actual CDC instructions for write to the CDC table
-        if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
-            let cdc_rowid_before_reg =
-                cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set");
-            if has_user_provided_rowid {
-                emit_cdc_insns(
+            // create full CDC record after update if necessary
+            let cdc_after_reg = if program.capture_data_changes_info().has_after() {
+                Some(emit_cdc_patch_record(
                     program,
-                    &t_ctx.resolver,
-                    OperationMode::DELETE,
-                    cdc_cursor_id,
-                    cdc_rowid_before_reg,
-                    cdc_before_reg,
-                    None,
-                    None,
-                    table_name,
-                )?;
-                emit_cdc_insns(
-                    program,
-                    &t_ctx.resolver,
-                    OperationMode::INSERT,
-                    cdc_cursor_id,
+                    &target_table.table,
+                    start,
+                    record_reg,
                     cdc_rowid_after_reg,
-                    cdc_after_reg,
-                    None,
-                    None,
-                    table_name,
-                )?;
+                ))
             } else {
-                emit_cdc_insns(
-                    program,
-                    &t_ctx.resolver,
-                    OperationMode::UPDATE(if ephemeral_plan.is_some() {
-                        UpdateRowSource::PrebuiltEphemeralTable {
-                            ephemeral_table_cursor_id: iteration_cursor_id,
-                            target_table: target_table.clone(),
-                        }
-                    } else {
-                        UpdateRowSource::Normal
-                    }),
-                    cdc_cursor_id,
-                    cdc_rowid_before_reg,
-                    cdc_before_reg,
-                    cdc_after_reg,
-                    cdc_updates_record,
-                    table_name,
-                )?;
+                None
+            };
+
+            let cdc_updates_record = if let Some(cdc_updates_register) = cdc_updates_register {
+                let record_reg = program.alloc_register();
+                program.emit_insn(Insn::MakeRecord {
+                    start_reg: to_u16(cdc_updates_register),
+                    count: to_u16(2 * col_len),
+                    dest_reg: to_u16(record_reg),
+                    index_name: None,
+                    affinity_str: None,
+                });
+                Some(record_reg)
+            } else {
+                None
+            };
+
+            // emit actual CDC instructions for write to the CDC table
+            if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
+                let cdc_rowid_before_reg =
+                    cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set");
+                if has_user_provided_rowid {
+                    emit_cdc_insns(
+                        program,
+                        &t_ctx.resolver,
+                        OperationMode::DELETE,
+                        cdc_cursor_id,
+                        cdc_rowid_before_reg,
+                        cdc_before_reg,
+                        None,
+                        None,
+                        table_name,
+                    )?;
+                    emit_cdc_insns(
+                        program,
+                        &t_ctx.resolver,
+                        OperationMode::INSERT,
+                        cdc_cursor_id,
+                        cdc_rowid_after_reg,
+                        cdc_after_reg,
+                        None,
+                        None,
+                        table_name,
+                    )?;
+                } else {
+                    emit_cdc_insns(
+                        program,
+                        &t_ctx.resolver,
+                        OperationMode::UPDATE(if ephemeral_plan.is_some() {
+                            UpdateRowSource::PrebuiltEphemeralTable {
+                                ephemeral_table_cursor_id: iteration_cursor_id,
+                                target_table: target_table.clone(),
+                            }
+                        } else {
+                            UpdateRowSource::Normal
+                        }),
+                        cdc_cursor_id,
+                        cdc_rowid_before_reg,
+                        cdc_before_reg,
+                        cdc_after_reg,
+                        cdc_updates_record,
+                        table_name,
+                    )?;
+                }
             }
         }
-    } else if target_table.virtual_table().is_some() {
-        let arg_count = col_len + 2;
-        program.emit_insn(Insn::VUpdate {
-            cursor_id: target_table_cursor_id,
-            arg_count,
-            start_reg: beg,
-            conflict_action: 0u16,
-        });
+        Table::Virtual(_) => {
+            let arg_count = col_len + 2;
+            program.emit_insn(Insn::VUpdate {
+                cursor_id: target_table_cursor_id,
+                arg_count,
+                start_reg: beg,
+                conflict_action: 0u16,
+            });
+        }
+        _ => {}
     }
 
     if let Some(limit_ctx) = t_ctx.limit_ctx {
@@ -2475,14 +2473,12 @@ fn emit_update_insns<'a>(
     Ok(())
 }
 
-/// Emit bytecode to evaluate a generated expression using register values.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn emit_generated_expr_from_registers(
+pub(super) fn emit_gencol_expr_from_registers(
     program: &mut ProgramBuilder,
     expr: &ast::Expr,
     target_reg: usize,
     registers_start: usize,
-    _column_lookup: &HashMap<String, usize>,
     columns: &[crate::schema::Column],
     resolver: &Resolver,
     rowid_reg: Option<usize>,
@@ -2518,9 +2514,8 @@ pub(super) fn compute_virtual_columns_for_update(
     program: &mut ProgramBuilder,
     columns: &[crate::schema::Column],
     registers: &VirtualColumnRegisters<'_>,
-    column_lookup: &HashMap<String, usize>,
     resolver: &Resolver,
-) -> crate::Result<()> {
+) -> Result<()> {
     for (idx, column) in columns.iter().enumerate() {
         if let GeneratedType::Virtual(expr) = column.generated_type() {
             match registers {
@@ -2529,12 +2524,11 @@ pub(super) fn compute_virtual_columns_for_update(
                     rowid_reg,
                 } => {
                     let target_reg = registers_start + idx;
-                    emit_generated_expr_from_registers(
+                    emit_gencol_expr_from_registers(
                         program,
                         expr,
                         target_reg,
                         *registers_start,
-                        column_lookup,
                         columns,
                         resolver,
                         *rowid_reg,
