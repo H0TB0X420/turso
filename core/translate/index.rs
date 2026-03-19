@@ -565,10 +565,6 @@ pub fn resolve_sorted_columns(
         let unwrapped_expr = unwrap_parens(base_expr)?;
         if let Some((pos, column_name, column)) = resolve_index_column(unwrapped_expr, table) {
             let collation = explicit_collation.or_else(|| column.collation_opt());
-            // For VIRTUAL generated columns, store the expression so it can be computed
-            // during INSERT (since VIRTUAL columns are not stored in the table record).
-            // Also store the column's affinity so it can be applied during index population
-            // (INTEGER→REAL conversions, etc., per SQLite's affinity rules).
             let (expr, affinity) = match column.generated_type() {
                 GeneratedType::Virtual(expr) => (Some(expr.clone()), Some(column.affinity())),
                 GeneratedType::NotGenerated => (None, None),
