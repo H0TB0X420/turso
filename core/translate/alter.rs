@@ -523,6 +523,12 @@ pub fn translate_alter_table(
                 )));
             }
 
+            if btree.columns.iter().any(|c| c.is_generated()) {
+                return Err(LimboError::ParseError(format!(
+                    "cannot drop column \"{column_name}\": DROP COLUMN is not supported on tables with generated columns"
+                )));
+            }
+
             let (dropped_index, column) = btree.get_column(column_name).ok_or_else(|| {
                 LimboError::ParseError(format!("no such column: \"{column_name}\""))
             })?;
