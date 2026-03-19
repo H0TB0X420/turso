@@ -127,8 +127,7 @@ pub fn get_expr_collation_ctx(
                 return Ok(WalkControl::SkipChildren);
             }
             Expr::Column { table, column, .. } => {
-                // SELF_TABLE columns (from generated column expressions) aren't in
-                // referenced_tables — skip; the cache is best-effort.
+                // generated columns don't inherit an implicit collation from their expression
                 if !table.is_self_table() {
                     let (_, table_ref) = referenced_tables
                         .find_table_by_internal_id(*table)
