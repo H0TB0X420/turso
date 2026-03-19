@@ -1,3 +1,16 @@
+use super::{
+    collate::get_collseq_from_expr,
+    emitter::Resolver,
+    plan::{
+        DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinOrderMember, JoinType,
+        JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search,
+        SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate, TableReferences, UpdatePlan,
+        WhereTerm,
+    },
+    planner::TableMask,
+    update::column_depends_on_updated,
+};
+use crate::schema::GeneratedType;
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::MultiIndexBranchAccess;
 use crate::{
@@ -50,19 +63,6 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::{self, Expr, SortOrder, SubqueryType, TriggerEvent};
-
-use super::{
-    collate::get_collseq_from_expr,
-    emitter::Resolver,
-    plan::{
-        DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinOrderMember, JoinType,
-        JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search,
-        SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate, TableReferences, UpdatePlan,
-        WhereTerm,
-    },
-    planner::TableMask,
-    update::column_depends_on_updated,
-};
 
 pub(crate) mod access_method;
 pub(crate) mod constraints;
@@ -791,103 +791,91 @@ fn first_update_safety_reason(
     resolver: &Resolver,
 ) -> Result<Option<DmlSafetyReason>> {
     let table_ref = &plan.table_references.joined_tables()[0];
-    let reason = 'requires: {
-        let Some(btree_table_arc) = table_ref.table.btree() else {
-            break 'requires None;
-        };
-        let btree_table = btree_table_arc.as_ref();
+    let reason =
+        'requires: {
+            let Some(btree_table_arc) = table_ref.table.btree() else {
+                break 'requires None;
+            };
+            let btree_table = btree_table_arc.as_ref();
 
-        // Multi-index scans gather rowids from multiple index branches.
-        // For UPDATE, we always use the prebuilt ephemeral-table path so writes run against
-        // that fixed rowid list (no surprises from branch/index overlap).
-        if matches!(table_ref.op, Operation::MultiIndexScan(_)) {
-            break 'requires Some(DmlSafetyReason::MultiIndexScan);
-        }
-
-        // Index method cursors that stream lazily need rowids collected first.
-        if let Operation::IndexMethodQuery(query) = &table_ref.op {
-            let attachment = query
-                .index
-                .index_method
-                .as_ref()
-                .expect("IndexMethodQuery always has an index_method attachment");
-            if !attachment.definition().results_materialized {
-                break 'requires Some(DmlSafetyReason::IndexMethodNotMaterialized);
+            // Multi-index scans gather rowids from multiple index branches.
+            // For UPDATE, we always use the prebuilt ephemeral-table path so writes run against
+            // that fixed rowid list (no surprises from branch/index overlap).
+            if matches!(table_ref.op, Operation::MultiIndexScan(_)) {
+                break 'requires Some(DmlSafetyReason::MultiIndexScan);
             }
-        }
 
-        // Check if there are UPDATE triggers
-        let updated_cols: HashSet<usize> = plan.set_clauses.iter().map(|(i, _)| *i).collect();
-        let database_id = table_ref.database_id;
-        if resolver.with_schema(database_id, |s| {
-            has_relevant_triggers_type_only(
-                s,
-                TriggerEvent::Update,
-                Some(&updated_cols),
-                btree_table,
-            )
-        }) {
-            break 'requires Some(DmlSafetyReason::Trigger);
-        }
-
-        // REPLACE mode requires ephemeral table because REPLACE deletes conflicting rows,
-        // which can corrupt the iteration order when iterating via an index.
-        if matches!(
-            plan.or_conflict,
-            Some(turso_parser::ast::ResolveType::Replace)
-        ) {
-            break 'requires Some(DmlSafetyReason::ReplaceMode);
-        }
-
-        let Some(index) = table_ref.op.index() else {
-            let rowid_alias_used = plan.set_clauses.iter().fold(false, |accum, (idx, _)| {
-                accum || (*idx != ROWID_SENTINEL && btree_table.columns[*idx].is_rowid_alias())
-            });
-            if rowid_alias_used {
-                break 'requires Some(DmlSafetyReason::KeyMutation);
+            // Index method cursors that stream lazily need rowids collected first.
+            if let Operation::IndexMethodQuery(query) = &table_ref.op {
+                let attachment = query
+                    .index
+                    .index_method
+                    .as_ref()
+                    .expect("IndexMethodQuery always has an index_method attachment");
+                if !attachment.definition().results_materialized {
+                    break 'requires Some(DmlSafetyReason::IndexMethodNotMaterialized);
+                }
             }
-            let direct_rowid_update = plan
-                .set_clauses
-                .iter()
-                .any(|(idx, _)| *idx == ROWID_SENTINEL);
-            if direct_rowid_update {
-                break 'requires Some(DmlSafetyReason::KeyMutation);
-            }
-            break 'requires None;
-        };
 
-        for (set_clause_col_idx, _) in plan.set_clauses.iter() {
-            for c in index.columns.iter() {
-                if let Some(ref expr) = c.expr {
-                    let expr_idx_cols_mask =
-                        expression_index_column_usage(expr.as_ref(), table_ref, resolver)?;
-                    if expr_idx_cols_mask.get(*set_clause_col_idx) {
-                        break 'requires Some(DmlSafetyReason::KeyMutation);
+            // Check if there are UPDATE triggers
+            let updated_cols: HashSet<usize> = plan.set_clauses.iter().map(|(i, _)| *i).collect();
+            let database_id = table_ref.database_id;
+            if resolver.with_schema(database_id, |s| {
+                has_relevant_triggers_type_only(
+                    s,
+                    TriggerEvent::Update,
+                    Some(&updated_cols),
+                    btree_table,
+                )
+            }) {
+                break 'requires Some(DmlSafetyReason::Trigger);
+            }
+
+            // REPLACE mode requires ephemeral table because REPLACE deletes conflicting rows,
+            // which can corrupt the iteration order when iterating via an index.
+            if matches!(
+                plan.or_conflict,
+                Some(turso_parser::ast::ResolveType::Replace)
+            ) {
+                break 'requires Some(DmlSafetyReason::ReplaceMode);
+            }
+
+            let Some(index) = table_ref.op.index() else {
+                let rowid_alias_used = plan.set_clauses.iter().fold(false, |accum, (idx, _)| {
+                    accum || (*idx != ROWID_SENTINEL && btree_table.columns[*idx].is_rowid_alias())
+                });
+                if rowid_alias_used {
+                    break 'requires Some(DmlSafetyReason::KeyMutation);
+                }
+                let direct_rowid_update = plan
+                    .set_clauses
+                    .iter()
+                    .any(|(idx, _)| *idx == ROWID_SENTINEL);
+                if direct_rowid_update {
+                    break 'requires Some(DmlSafetyReason::KeyMutation);
+                }
+                break 'requires None;
+            };
+
+            for (set_clause_col_idx, _) in plan.set_clauses.iter() {
+                for c in index.columns.iter() {
+                    if let Some(ref expr) = c.expr {
+                        let expr_idx_cols_mask =
+                            expression_index_column_usage(expr.as_ref(), table_ref, resolver)?;
+                        if expr_idx_cols_mask.get(*set_clause_col_idx) {
+                            break 'requires Some(DmlSafetyReason::KeyMutation);
+                        }
                     }
                 }
             }
-        }
 
-        // Check if any index column is directly updated or transitively depends on updated columns
-        if index.columns.iter().any(|c| {
-            // Direct update of index column
-            if updated_cols.contains(&c.pos_in_table) {
-                return true;
+            if index.columns.iter().any(|c| {
+                column_depends_on_updated(c.pos_in_table, &btree_table.columns, &updated_cols)
+            }) {
+                break 'requires Some(DmlSafetyReason::KeyMutation);
             }
-            // Check if this is a generated column that depends on any updated column
-            if btree_table.columns[c.pos_in_table].is_generated() {
-                return column_depends_on_updated(
-                    c.pos_in_table,
-                    &btree_table.columns,
-                    &updated_cols,
-                );
-            }
-            false
-        }) {
-            break 'requires Some(DmlSafetyReason::KeyMutation);
-        }
-        break 'requires None;
-    };
+            break 'requires None;
+        };
 
     Ok(reason)
 }
@@ -2902,10 +2890,9 @@ fn ephemeral_index_build(
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            let (expr, affinity) = if c.is_virtual_generated() {
-                (c.generated_expr_cloned(), Some(c.affinity()))
-            } else {
-                (None, None)
+            let (expr, affinity) = match c.generated_type() {
+                GeneratedType::Virtual(_) => (c.generated_expr_cloned(), Some(c.affinity())),
+                GeneratedType::NotGenerated => (None, None),
             };
             IndexColumn {
                 name: c.name.clone().unwrap(),

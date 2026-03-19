@@ -1,4 +1,3 @@
-use turso_macros::turso_assert_unreachable;
 use super::*;
 use crate::schema::GeneratedType;
 use crate::translate::emitter::HashLabels;
@@ -417,13 +416,16 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         let (payload_start_reg, mut payload_info) = if num_payload > 0 {
             let payload_reg = planner.program.alloc_registers(num_payload);
             for (i, &col_idx) in config.payload_signature_columns.iter().enumerate() {
-                let is_virtual = match build_table.columns().get(col_idx).map(|c| c.generated_type()) {
+                let is_virtual = match build_table
+                    .columns()
+                    .get(col_idx)
+                    .map(|c| c.generated_type())
+                {
                     Some(GeneratedType::Virtual(expr)) => {
-                        planner.program.self_table_context =
-                            Some(SelfTableContext::ForSelect {
-                                table_ref_id: build_table.internal_id,
-                                referenced_tables: planner.table_references.clone(),
-                            });
+                        planner.program.self_table_context = Some(SelfTableContext::ForSelect {
+                            table_ref_id: build_table.internal_id,
+                            referenced_tables: planner.table_references.clone(),
+                        });
                         translate_expr(
                             planner.program,
                             Some(planner.table_references),
