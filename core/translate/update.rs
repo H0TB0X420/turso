@@ -1,7 +1,10 @@
 use crate::sync::Arc;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use crate::schema::{collect_column_dependencies_of_expr, Column, GeneratedType, StoppableWalkControl, ROWID_SENTINEL};
+use crate::schema::{
+    collect_column_dependencies_of_expr, Column, GeneratedType, StoppableWalkControl,
+    ROWID_SENTINEL,
+};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
 use crate::translate::expression_index::expression_index_column_usage;
@@ -474,11 +477,7 @@ pub fn prepare_update_plan(
                         }
                         // If column in expression is a generated column, check transitive deps
                         if columns[cidx].is_generated() {
-                            return column_depends_on_updated(
-                                cidx,
-                                columns,
-                                &updated_cols,
-                            );
+                            return column_depends_on_updated(cidx, columns, &updated_cols);
                         }
                         false
                     }) {
@@ -492,11 +491,7 @@ pub fn prepare_update_plan(
                     // Check if this column is a generated column and if any of its
                     // dependencies are being updated. This uses transitive checking to
                     // handle chains like: generated -> VIRTUAL -> regular column.
-                    if column_depends_on_updated(
-                        col.pos_in_table,
-                        columns,
-                        &updated_cols,
-                    ) {
+                    if column_depends_on_updated(col.pos_in_table, columns, &updated_cols) {
                         needs = true;
                         break;
                     }

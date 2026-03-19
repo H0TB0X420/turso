@@ -2188,7 +2188,7 @@ fn emit_update_insns<'a>(
             if connection.foreign_keys_enabled() {
                 emit_fk_parent_new_key_reconcile(
                     program,
-                    &table,
+                    table,
                     start,
                     rowid_set_clause_reg.unwrap_or(beg),
                     set_clauses,
@@ -2487,7 +2487,7 @@ pub(super) fn emit_gencol_expr_from_registers(
         registers_start,
         rowid_reg,
     ));
-    translate_expr(program, None, &expr, target_reg, resolver)?;
+    translate_expr(program, None, expr, target_reg, resolver)?;
     Ok(())
 }
 
@@ -2539,7 +2539,7 @@ pub(super) fn compute_virtual_columns_for_update(
                     columns: columns.to_vec(),
                 });
 
-                translate_expr(program, None, &expr, target_reg, resolver)?;
+                translate_expr(program, None, expr, target_reg, resolver)?;
                 program.emit_column_affinity(target_reg, column.affinity());
             }
         }

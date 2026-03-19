@@ -413,7 +413,7 @@ fn translate_integrity_check_impl(
                         translate_expr_no_constant_opt(
                             program,
                             Some(&table_references),
-                            &expr,
+                            expr,
                             target,
                             resolver,
                             NoConstantOptReason::RegisterReuse,
