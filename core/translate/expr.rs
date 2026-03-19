@@ -3176,21 +3176,15 @@ pub fn translate_expr(
                         } else {
                             false
                         };
+
                         // Check if this is a virtual generated column that needs expression evaluation
-                        let table_column = table.get_column_at(*column);
-                        let Some(table_column) = table_column else {
+                        let Some(table_column) = table.get_column_at(*column) else {
                             crate::bail_parse_error!("column index out of bounds");
                         };
-
                         match table_column.generated_type() {
+                            // if we're reading from an index that contains this virtual column,
+                            // the index already has the computed value, so read it from the index
                             GeneratedType::Virtual(expr) if !read_from_index => {
-                                // VIRTUAL generated columns are computed from other columns, not stored.
-                                // We need to evaluate the generated expression.
-                                // However, if we're reading from an index that contains this VIRTUAL column,
-                                // the index already has the pre-computed value - we can read it directly.
-
-                                // Set up SelfTableContext so that Expr::Column { SELF_TABLE }
-                                // in the generated expression remaps to the real table reference.
                                 program.with_self_table_context(
                                     Some(&SelfTableContext::ForSelect {
                                         table_ref_id: *table_ref_id,
@@ -3208,9 +3202,6 @@ pub fn translate_expr(
                                     },
                                 )?;
 
-                                // Apply the VIRTUAL column's declared affinity to the
-                                // computed result. The expression may produce a different
-                                // type (e.g. REAL when the column is INTEGER).
                                 program.emit_insn(Insn::Affinity {
                                     start_reg: target_register,
                                     count: std::num::NonZeroUsize::MIN,
