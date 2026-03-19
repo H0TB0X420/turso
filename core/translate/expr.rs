@@ -2962,7 +2962,6 @@ pub fn translate_expr(
             column,
             is_rowid_alias,
         } if table_ref_id.is_self_table() => {
-            // Take the context out to avoid borrow conflict with `program`.
             return program.with_existing_self_table_context(|program, self_table_context| {
                 match self_table_context {
                     Some(SelfTableContext::ForSelect {
