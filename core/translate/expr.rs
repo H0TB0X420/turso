@@ -3255,18 +3255,18 @@ pub fn translate_expr(
                         let Some(column) = table.get_column_at(*column) else {
                             crate::bail_parse_error!("column index out of bounds");
                         };
-                        // Apply RealAffinity for stored columns read from cursor/index.
-                        // Virtual generated columns already had full affinity applied above.
                         // Skip affinity for custom types — the stored value is
                         // already in BASE type format; the custom type name may
                         // produce wrong affinity (e.g. "doubled" → REAL due to "DOUB").
+                        //
+                        // Also skip for virtual columns without a stored index value,
+                        // we already applied affinity for these.
                         let virtual_already_applied =
                             table_column.is_virtual_generated() && !read_from_index;
-                        if !virtual_already_applied
-                            && resolver
-                                .schema()
-                                .get_type_def(&column.ty_str, table.is_strict())
-                                .is_none()
+                        if !(virtual_already_applied || resolver
+                            .schema()
+                            .get_type_def(&column.ty_str, table.is_strict())
+                            .is_some())
                         {
                             maybe_apply_affinity(column.ty(), target_register, program);
                         }
@@ -5195,7 +5195,7 @@ pub fn maybe_apply_affinity(col_type: Type, target_register: usize, program: &mu
     if col_type == Type::Real {
         program.emit_insn(Insn::RealAffinity {
             register: target_register,
-        });
+        })
     }
 }
 
@@ -6113,11 +6113,6 @@ pub(crate) fn get_expr_affinity_info(
 ) -> ExprAffinityInfo {
     match expr {
         ast::Expr::Column { table, column, .. } => {
-            //TODO will this work?
-            // if table.is_self_table() {
-            //         .map(ExprAffinityInfo::with_affinity)
-            //         .unwrap_or_else(ExprAffinityInfo::no_affinity);
-            // }
             if let Some(tables) = referenced_tables {
                 if let Some((_, table_ref)) = tables.find_table_by_internal_id(*table) {
                     if let Some(col) = table_ref.get_column_at(*column) {
