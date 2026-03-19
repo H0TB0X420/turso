@@ -107,6 +107,7 @@ impl CursorKey {
 
 /// Context for resolving `Expr::Column` with `TableInternalId::SELF_TABLE`.
 /// Set during generated column evaluation, `None` otherwise.
+#[derive(Clone)]
 pub enum SelfTableContext {
     /// SELECT path: remap SELF_TABLE to this real table reference.
     ForSelect {
@@ -1785,7 +1786,7 @@ impl ProgramBuilder {
         &mut self,
         f: impl FnOnce(&mut ProgramBuilder, Option<&SelfTableContext>) -> crate::Result<T>,
     ) -> crate::Result<T> {
-        let self_table_context = self.self_table_context.take();
+        let self_table_context = self.self_table_context.clone();
         let result = f(self, self_table_context.as_ref())?;
         self.self_table_context = self_table_context;
         Ok(result)
@@ -1796,7 +1797,11 @@ impl ProgramBuilder {
         ctx: Option<&SelfTableContext>,
         f: impl FnOnce(&mut ProgramBuilder, Option<&SelfTableContext>) -> crate::Result<T>,
     ) -> crate::Result<T> {
-        f(self, ctx)
+        let prev = self.self_table_context.take();
+        self.self_table_context = ctx.cloned();
+        let result = f(self, ctx);
+        self.self_table_context = prev;
+        result
     }
 
     pub fn self_table_context(&self) -> &Option<SelfTableContext> {
