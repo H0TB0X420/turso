@@ -2453,12 +2453,12 @@ impl FromClauseSubquery {
 }
 
 fn collect_column_refs(expr: &Expr) -> HashSet<String> {
-    collect_column_refs_with_columns(expr, &[])
+    collect_column_dependencies_of_expr(expr, &[])
 }
 
 /// Extract all column name references from an expression as a set.
 /// `columns` is used to resolve pre-resolved `Expr::Column { SELF_TABLE }` back to names.
-pub fn collect_column_refs_with_columns(expr: &Expr, columns: &[Column]) -> HashSet<String> {
+pub fn collect_column_dependencies_of_expr(expr: &Expr, columns: &[Column]) -> HashSet<String> {
     let mut refs = HashSet::default();
     let _ = walk_expr(expr, &mut |e| match e {
         Expr::Id(name) | Expr::Name(name) => {

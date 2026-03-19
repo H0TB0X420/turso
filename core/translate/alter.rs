@@ -5,6 +5,10 @@ use turso_parser::{
     parser::Parser,
 };
 
+use super::{
+    schema::{validate_check_expr, SQLITE_TABLEID},
+    update::translate_update_for_schema_change,
+};
 use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
     function::{AlterTableFunc, Func},
@@ -27,11 +31,7 @@ use crate::{
     LimboError, Numeric, Result, Value,
 };
 use either::Either;
-
-use super::{
-    schema::{validate_check_expr, SQLITE_TABLEID},
-    update::translate_update_for_schema_change,
-};
+use turso_macros::turso_debug_assert;
 
 fn validate(alter_table: &ast::AlterTableBody, table_name: &str) -> Result<()> {
     // Check if someone is trying to ALTER a system table
@@ -668,11 +668,15 @@ pub fn translate_alter_table(
             // Check if column is referenced by any generated column expression
             for col in btree.columns.iter() {
                 if let Some(generated_expr) = col.generated_expr() {
-                    let refs = crate::schema::collect_column_refs_with_columns(
+                    let column_dependencies = crate::schema::collect_column_dependencies_of_expr(
                         generated_expr,
                         &btree.columns,
                     );
-                    if refs.contains(&column_name_norm) {
+                    if column_dependencies.contains(&column_name_norm) {
+                        turso_debug_assert!(
+                            col.name.is_some(),
+                            "generated column should have a name"
+                        );
                         let gen_col_name = col.name.as_deref().unwrap_or("<unnamed>");
                         return Err(LimboError::ParseError(format!(
                             "cannot drop column \"{column_name}\": referenced by generated column \"{gen_col_name}\""
@@ -742,18 +746,10 @@ pub fn translate_alter_table(
                 connection,
                 input,
                 |program| {
-                    // Count only storable columns (exclude VIRTUAL generated columns)
-                    let storable_count = btree
-                        .columns
-                        .iter()
-                        .filter(|c| !c.is_virtual_generated())
-                        .count();
+                    let storable_count = btree.columns.iter().filter(|c| c.is_storable()).count();
                     let root_page = btree.root_page;
                     let table_name = btree.name.clone();
-
-                    // Clone the columns info for use in the closure
                     let original_columns = original_btree.columns.clone();
-
                     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree));
 
                     program.emit_insn(Insn::OpenWrite {
@@ -769,14 +765,11 @@ pub fn translate_alter_table(
 
                         // Iterate through OLD columns and copy storable ones
                         // Skip: 1) the dropped column, 2) VIRTUAL generated columns
+                        //TODO see if I can avoid cloning original_columns.
                         for (i, col) in original_columns.iter().enumerate() {
-                            if i == dropped_index {
+                            if i == dropped_index || !col.is_storable() {
                                 continue;
-                            }
-                            // Skip VIRTUAL generated columns - they are not stored in records
-                            if col.is_virtual_generated() {
-                                continue;
-                            }
+                            };
 
                             program.emit_column_or_rowid(cursor_id, i, iter);
 
@@ -785,11 +778,10 @@ pub fn translate_alter_table(
 
                         let record = program.alloc_register();
 
-                        // Build affinity string only for storable columns
                         let affinity_str = btree
                             .columns
                             .iter()
-                            .filter(|c| !c.is_virtual_generated())
+                            .filter(|c| c.is_storable())
                             .map(|col| col.affinity_with_strict(btree.is_strict).aff_mask())
                             .collect::<String>();
 

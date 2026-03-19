@@ -1,7 +1,7 @@
 use crate::sync::Arc;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use crate::schema::{collect_column_refs_with_columns, Column, GeneratedType, StoppableWalkControl, ROWID_SENTINEL};
+use crate::schema::{collect_column_dependencies_of_expr, Column, GeneratedType, StoppableWalkControl, ROWID_SENTINEL};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
 use crate::translate::expression_index::expression_index_column_usage;
@@ -620,7 +620,7 @@ where
     let GeneratedType::Virtual(ref expr) = columns[start_idx].generated_type() else {
         return false;
     };
-    for ref_name in collect_column_refs_with_columns(expr, columns) {
+    for ref_name in collect_column_dependencies_of_expr(expr, columns) {
         let Some(&dep_idx) = column_lookup.get(&ref_name.to_lowercase()) else {
             continue;
         };
