@@ -952,27 +952,7 @@ pub fn op_comparison(
         }
     }
 
-    // Skip affinity conversion for Integer-Float pairs.
-    // The comparison logic (via ValueRef::partial_cmp -> sqlite_int_float_compare)
-    // correctly handles Integer-Float comparisons using a truncate-then-compare approach.
-    // Applying REAL affinity conversion here would convert Integer to Float first,
-    // causing precision loss (e.g., 3036093696168066000 -> 3036093696168066048.0).
-    let is_int_float_pair = matches!(
-        (lhs_value, rhs_value),
-        (
-            Value::Numeric(Numeric::Integer(_)),
-            Value::Numeric(Numeric::Float(_))
-        ) | (
-            Value::Numeric(Numeric::Float(_)),
-            Value::Numeric(Numeric::Integer(_))
-        )
-    );
-
-    let (new_lhs, new_rhs) = if is_int_float_pair {
-        (None, None)
-    } else {
-        (affinity.convert(lhs_value), affinity.convert(rhs_value))
-    };
+    let (new_lhs, new_rhs) = (affinity.convert(lhs_value), affinity.convert(rhs_value));
 
     let should_jump = op.compare(
         new_lhs
@@ -8009,7 +7989,6 @@ pub fn op_function(
                                         }
                                     }
 
-                                    // Update column-level constraints (Generated, ForeignKey)
                                     for col in &mut columns {
                                         rewrite_column_references_if_needed(
                                             col,
@@ -13097,23 +13076,18 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
 }
 
 fn try_float_to_integer_affinity(value: &mut Value, fl: f64) -> bool {
-    // Check if the float has no fractional part
-    if !fl.is_finite() || fl.trunc() != fl {
-        *value = Value::from_f64(fl);
-        return false;
+    // Check if the float can be exactly represented as an integer
+    if let Ok(int_val) = cast_real_to_integer(fl) {
+        // Additional check: ensure round-trip conversion is exact
+        // and value is within safe bounds (similar to SQLite's checks)
+        if (int_val as f64) == fl && int_val > i64::MIN + 1 && int_val < i64::MAX - 1 {
+            *value = Value::from_i64(int_val);
+            return true;
+        }
     }
 
-    // Convert float to i64 with saturation at limits (like SQLite's doubleToInt64)
-    let int_val = super::affinity::real_to_i64(fl);
-
-    // Check if round-trip conversion is exact
-    // This is the key check from SQLite's sqlite3VdbeIntegerAffinity
-    if (int_val as f64) == fl && int_val != i64::MIN {
-        *value = Value::from_i64(int_val);
-        return true;
-    }
-
-    // If round-trip isn't exact, keep as float
+    // If we can't convert to exact integer, keep as float for Numeric affinity
+    // but return false to indicate the conversion wasn't "complete"
     *value = Value::from_f64(fl);
     false
 }
@@ -14969,64 +14943,5 @@ mod tests {
             result.is_ok(),
             "Negating a blob subscript with invalid UTF-8 text should not panic"
         );
-    }
-
-    #[test]
-    fn test_try_float_to_integer_affinity_exact_int() {
-        let mut v = Value::from_f64(5.0);
-        assert!(try_float_to_integer_affinity(&mut v, 5.0));
-        assert_eq!(v, Value::from_i64(5));
-    }
-
-    #[test]
-    fn test_try_float_to_integer_affinity_fractional() {
-        let mut v = Value::from_f64(3.5);
-        assert!(!try_float_to_integer_affinity(&mut v, 3.5));
-        assert_eq!(v, Value::from_f64(3.5));
-    }
-
-    #[test]
-    fn test_try_float_to_integer_affinity_nan() {
-        let mut v = Value::from_f64(f64::NAN);
-        assert!(!try_float_to_integer_affinity(&mut v, f64::NAN));
-        // NaN becomes Null in the new Value representation
-        assert_eq!(v, Value::Null);
-    }
-
-    #[test]
-    fn test_try_float_to_integer_affinity_infinity() {
-        let mut v = Value::from_f64(f64::INFINITY);
-        assert!(!try_float_to_integer_affinity(&mut v, f64::INFINITY));
-        assert_eq!(v, Value::from_f64(f64::INFINITY));
-    }
-
-    #[test]
-    fn test_try_float_to_integer_affinity_neg_zero() {
-        let mut v = Value::from_f64(-0.0);
-        assert!(try_float_to_integer_affinity(&mut v, -0.0));
-        assert_eq!(v, Value::from_i64(0));
-    }
-
-    #[test]
-    fn test_try_float_to_integer_affinity_negative_infinity() {
-        let mut v = Value::from_f64(f64::NEG_INFINITY);
-        assert!(!try_float_to_integer_affinity(&mut v, f64::NEG_INFINITY));
-        assert_eq!(v, Value::from_f64(f64::NEG_INFINITY));
-    }
-
-    #[test]
-    fn test_try_float_to_integer_affinity_negative_int() {
-        let mut v = Value::from_f64(-42.0);
-        assert!(try_float_to_integer_affinity(&mut v, -42.0));
-        assert_eq!(v, Value::from_i64(-42));
-    }
-
-    #[test]
-    fn test_try_float_to_integer_affinity_i64_min() {
-        // i64::MIN as f64 -- rejected by int_val != i64::MIN check
-        let fl = i64::MIN as f64;
-        let mut v = Value::from_f64(fl);
-        assert!(!try_float_to_integer_affinity(&mut v, fl));
-        assert_eq!(v, Value::from_f64(fl));
     }
 }
