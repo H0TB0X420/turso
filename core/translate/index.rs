@@ -565,9 +565,9 @@ pub fn resolve_sorted_columns(
         let unwrapped_expr = unwrap_parens(base_expr)?;
         if let Some((pos, column_name, column)) = resolve_index_column(unwrapped_expr, table) {
             let collation = explicit_collation.or_else(|| column.collation_opt());
-            let (expr, affinity) = match column.generated_type() {
-                GeneratedType::Virtual(expr) => (Some(expr.clone()), Some(column.affinity())),
-                GeneratedType::NotGenerated => (None, None),
+            let expr = match column.generated_type() {
+                GeneratedType::Virtual(expr) => Some(expr.clone()),
+                GeneratedType::NotGenerated => None,
             };
             resolved.push(IndexColumn {
                 name: column_name,
@@ -576,7 +576,6 @@ pub fn resolve_sorted_columns(
                 collation,
                 default: column.default.clone(),
                 expr,
-                affinity,
             });
             continue;
         }
@@ -590,7 +589,6 @@ pub fn resolve_sorted_columns(
             collation: explicit_collation,
             default: None,
             expr: Some(sc.expr.clone()),
-            affinity: None,
         });
     }
     Ok(resolved)
@@ -830,23 +828,13 @@ fn emit_index_column_value_from_cursor(
         // (virtual column expressions pre-resolved at schema time).
         let joined = table_references.joined_tables().first();
         let self_table_context = joined.map(|jt| SelfTableContext::ForSelect {
-                table_ref_id: jt.internal_id,
-                referenced_tables: table_references.clone(),
-            });
+            table_ref_id: jt.internal_id,
+            referenced_tables: table_references.clone(),
+        });
         program.with_self_table_context(self_table_context.as_ref(), |program, _| {
             translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
             Ok(())
         })?;
-
-        // Apply column affinity for VIRTUAL columns. This ensures INTEGER→REAL
-        // conversions (and other affinity rules) happen per SQLite's documentation.
-        if let Some(affinity) = &idx_col.affinity {
-            program.emit_insn(Insn::Affinity {
-                start_reg: dest_reg,
-                count: std::num::NonZeroUsize::new(1).unwrap(),
-                affinities: affinity.aff_mask().to_string(),
-            });
-        }
     } else {
         program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
     }

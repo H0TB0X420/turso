@@ -3379,10 +3379,6 @@ fn emit_index_column_value_for_insert(
             },
         )?;
 
-        // Apply column affinity for VIRTUAL columns.
-        if let Some(affinity) = &idx_col.affinity {
-            program.emit_column_affinity(dest_reg, *affinity);
-        }
     } else {
         let Some(cm) = insertion.get_col_mapping_by_name(&idx_col.name) else {
             return Err(LimboError::PlanningError(

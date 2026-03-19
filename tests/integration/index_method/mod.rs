@@ -67,7 +67,6 @@ fn test_vector_sparse_ivf_create_destroy(tmp_db: TempDatabase) {
                 collation: None,
                 default: None,
                 expr: None,
-                affinity: None,
             }],
             parameters: HashMap::default(),
         })
@@ -111,7 +110,6 @@ fn test_vector_sparse_ivf_insert_query(tmp_db: TempDatabase) {
                 collation: None,
                 default: None,
                 expr: None,
-                affinity: None,
             }],
             parameters: HashMap::default(),
         })
@@ -202,7 +200,6 @@ fn test_vector_sparse_ivf_update(tmp_db: TempDatabase) {
                 collation: None,
                 default: None,
                 expr: None,
-                affinity: None,
             }],
             parameters: HashMap::default(),
         })
@@ -422,7 +419,6 @@ fn test_fts_create_destroy(tmp_db: TempDatabase) {
                     collation: None,
                     default: None,
                     expr: None,
-                    affinity: None,
                 },
                 IndexColumn {
                     name: "body".to_string(),
@@ -431,7 +427,6 @@ fn test_fts_create_destroy(tmp_db: TempDatabase) {
                     collation: None,
                     default: None,
                     expr: None,
-                    affinity: None,
                 },
             ],
             parameters: HashMap::default(),
@@ -483,7 +478,6 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
                     collation: None,
                     default: None,
                     expr: None,
-                    affinity: None,
                 },
                 IndexColumn {
                     name: "body".to_string(),
@@ -492,7 +486,6 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
                     collation: None,
                     default: None,
                     expr: None,
-                    affinity: None,
                 },
             ],
             parameters: HashMap::default(),

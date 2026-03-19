@@ -34,7 +34,6 @@ pub(super) fn open_in_seek_source_cursor(
                     collation,
                     default: None,
                     expr: None,
-                    affinity: None,
                 }],
                 unique: true,
                 ephemeral: true,

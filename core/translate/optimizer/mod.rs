@@ -2890,9 +2890,9 @@ fn ephemeral_index_build(
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            let (expr, affinity) = match c.generated_type() {
-                GeneratedType::Virtual(_) => (c.generated_expr_cloned(), Some(c.affinity())),
-                GeneratedType::NotGenerated => (None, None),
+            let expr = match c.generated_type() {
+                GeneratedType::Virtual(_) => c.generated_expr_cloned(),
+                GeneratedType::NotGenerated => None,
             };
             IndexColumn {
                 name: c.name.clone().unwrap(),
@@ -2901,7 +2901,6 @@ fn ephemeral_index_build(
                 collation: c.collation_opt(),
                 default: c.default.clone(),
                 expr: expr.map(Box::new),
-                affinity,
             }
         })
         // only include columns that are used in the query

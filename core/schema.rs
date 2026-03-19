@@ -3941,9 +3941,6 @@ pub struct IndexColumn {
     pub default: Option<Box<Expr>>,
     /// Expression for expression indexes. None for simple column indexes.
     pub expr: Option<Box<Expr>>,
-    /// Affinity to apply when computing VIRTUAL column expressions for index storage.
-    /// This ensures INTEGER->REAL conversions happen per SQLite's affinity rules.
-    pub affinity: Option<Affinity>,
 }
 
 impl Index {
@@ -4056,7 +4053,6 @@ impl Index {
                 collation: column.collation_opt(),
                 default: column.default.clone(),
                 expr: None,
-                affinity: None,
             });
         }
 
@@ -4104,7 +4100,6 @@ impl Index {
                 collation: col.collation_opt(),
                 default: col.default.clone(),
                 expr: None,
-                affinity: None,
             });
         }
 
