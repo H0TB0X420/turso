@@ -2962,6 +2962,8 @@ pub fn translate_expr(
             column,
             is_rowid_alias,
         } if table_ref_id.is_self_table() => {
+            // the table was a SELF_TABLE placeholder (used for generated columns), so we now have
+            // to resolve it to the actual reference id using the SelfTableContext.
             return program.with_existing_self_table_context(|program, self_table_context| {
                 match self_table_context {
                     Some(SelfTableContext::ForSelect {
@@ -2986,31 +2988,27 @@ pub fn translate_expr(
                         ref column_regs,
                         ref columns,
                     }) => {
-                        // Check if the referenced column is itself a virtual column
-                        let is_virtual = columns.get(*column).and_then(|col| {
-                            if let GeneratedType::Virtual(gen_expr) = col.generated_type() {
-                                Some((gen_expr.clone(), col.affinity()))
-                            } else {
-                                None
+                        let col = &columns[*column];
+                        match col.generated_type() {
+                            GeneratedType::Virtual(gen_expr) => {
+                                translate_expr(program, None, gen_expr, target_register, resolver)?;
+                                program.emit_insn(Insn::Affinity {
+                                    start_reg: target_register,
+                                    count: std::num::NonZeroUsize::MIN,
+                                    affinities: col.affinity().aff_mask().to_string(),
+                                });
+                                return Ok(target_register);
                             }
-                        });
-                        if let Some((gen_expr, affinity)) = is_virtual {
-                            translate_expr(program, None, &gen_expr, target_register, resolver)?;
-                            program.emit_insn(Insn::Affinity {
-                                start_reg: target_register,
-                                count: std::num::NonZeroUsize::MIN,
-                                affinities: affinity.aff_mask().to_string(),
-                            });
-                            return Ok(target_register);
+                            GeneratedType::NotGenerated => {
+                                let src_reg = column_regs[*column];
+                                program.emit_insn(Insn::Copy {
+                                    src_reg,
+                                    dst_reg: target_register,
+                                    extra_amount: 0,
+                                });
+                                Ok(target_register)
+                            }
                         }
-                        // Non-virtual column: copy from register
-                        let src_reg = column_regs[*column];
-                        program.emit_insn(Insn::Copy {
-                            src_reg,
-                            dst_reg: target_register,
-                            extra_amount: 0,
-                        });
-                        Ok(target_register)
                     }
                     None => {
                         crate::bail_parse_error!(
