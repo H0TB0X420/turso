@@ -2288,3 +2288,16 @@ test gencol_stored_generated_always_rejected {
 expect error {
     STORED generated columns are not supported
 }
+
+# Generated columns use their own collation (BINARY), not the source column's
+test gencol_collation_not_inherited {
+    CREATE TABLE t1(name TEXT COLLATE NOCASE, gen TEXT GENERATED ALWAYS AS (name));
+    INSERT INTO t1(name) VALUES('b'),('a'),('B'),('A');
+    SELECT gen FROM t1 ORDER BY gen;
+}
+expect {
+    A
+    B
+    a
+    b
+}
