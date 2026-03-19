@@ -2664,18 +2664,21 @@ pub fn compute_virtual_columns_for_triggers<'a>(
     rowid_alias: Option<&ColMapping<'a>>,
     resolver: &Resolver,
 ) -> Result<()> {
-    let saved_context = program.self_table_context.take();
-    program.self_table_context = Some(self_table_ctx_from_col_mappings(col_mappings, rowid_alias));
-
     for col_mapping in col_mappings {
         if let GeneratedType::Virtual(expr) = col_mapping.column.generated_type() {
             let expr = expr.as_ref().clone();
-            translate_expr(program, None, &expr, col_mapping.register, resolver)?;
+
+            program.with_self_table_context(
+                Some(self_table_ctx_from_col_mappings(col_mappings, rowid_alias)),
+                |program| {
+                    translate_expr(program, None, &expr, col_mapping.register, resolver)?;
+                    Ok(())
+                },
+            )?;
             program.emit_column_affinity(col_mapping.register, col_mapping.column.affinity());
         }
     }
 
-    program.self_table_context = saved_context;
     Ok(())
 }
 
@@ -3365,15 +3368,13 @@ fn emit_index_column_value_for_insert(
             .collect();
         schema::resolve_gencol_names(&mut expr, &columns)?;
 
-        let saved = program.self_table_context.take();
-        program.self_table_context = Some(self_table_ctx_from_col_mappings(
+        program.with_self_table_context(Some(self_table_ctx_from_col_mappings(
             &insertion.col_mappings,
             insertion.rowid_alias_mapping(),
-        ));
-
+        )), |program| {
         translate_expr(program, None, &expr, dest_reg, resolver)?;
-
-        program.self_table_context = saved;
+            Ok(())
+        })?;
 
         // Apply column affinity for VIRTUAL columns.
         if let Some(affinity) = &idx_col.affinity {

@@ -1411,20 +1411,25 @@ pub(crate) fn emit_index_column_value_old_image(
 
         //TODO will this work if right_join_swapped is true?
         let joined = table_references.joined_tables().first();
-        if let Some(jt) = joined {
-            program.self_table_context = Some(SelfTableContext::ForSelect {
+        let self_table_context = if let Some(jt) = joined {
+            Some(SelfTableContext::ForSelect {
                 table_ref_id: jt.internal_id,
                 referenced_tables: table_references.clone(),
-            });
-        }
-        translate_expr_no_constant_opt(
-            program,
-            Some(table_references),
-            &expr,
-            dest_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
+            })
+        } else {
+            None
+        };
+        program.with_self_table_context(self_table_context, |program| {
+            translate_expr_no_constant_opt(
+                program,
+                Some(table_references),
+                &expr,
+                dest_reg,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
+            Ok(())
+        })?;
     } else {
         program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
     }
@@ -1464,19 +1469,23 @@ fn emit_index_column_value_new_image(
             is_strict,
         )?;
 
-        program.self_table_context = Some(SelfTableContext::for_contiguous_regs(
-            columns,
-            columns_start_reg,
-            Some(rowid_reg),
-        ));
-
-        translate_expr_no_constant_opt(
-            program,
-            None,
-            &expr,
-            dest_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
+        program.with_self_table_context(
+            Some(SelfTableContext::for_contiguous_regs(
+                columns,
+                columns_start_reg,
+                Some(rowid_reg),
+            )),
+            |program| {
+                translate_expr_no_constant_opt(
+                    program,
+                    None,
+                    &expr,
+                    dest_reg,
+                    resolver,
+                    NoConstantOptReason::RegisterReuse,
+                )?;
+                Ok(())
+            },
         )?;
     } else {
         let col_in_table = columns

@@ -833,17 +833,19 @@ fn emit_index_column_value_from_cursor(
         // Set up SelfTableContext for any SELF_TABLE references in the expression
         // (virtual column expressions pre-resolved at schema time).
         let joined = table_references.joined_tables().first();
-        if let Some(jt) = joined {
-            let saved = program.self_table_context.take();
-            program.self_table_context = Some(crate::vdbe::builder::SelfTableContext::ForSelect {
+        let self_table_context = if let Some(jt) = joined {
+            Some(crate::vdbe::builder::SelfTableContext::ForSelect {
                 table_ref_id: jt.internal_id,
                 referenced_tables: table_references.clone(),
-            });
-            translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
-            program.self_table_context = saved;
+            })
         } else {
+            None
+        };
+        program.with_self_table_context(self_table_context, |program| {
             translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
-        }
+            Ok(())
+        })?;
+
         // Apply column affinity for VIRTUAL columns. This ensures INTEGER→REAL
         // conversions (and other affinity rules) happen per SQLite's documentation.
         if let Some(affinity) = &idx_col.affinity {

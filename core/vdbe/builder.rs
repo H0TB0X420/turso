@@ -1781,4 +1781,16 @@ impl ProgramBuilder {
         let prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
         Ok(Program::from_prepared(Arc::new(prepared), connection))
     }
+
+    pub fn with_self_table_context(
+        &mut self,
+        ctx: Option<SelfTableContext>,
+        f: impl FnOnce(&mut ProgramBuilder) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        let old_ctx = self.self_table_context.take();
+        self.self_table_context = ctx;
+        f(self)?;
+        self.self_table_context = old_ctx;
+        Ok(())
+    }
 }

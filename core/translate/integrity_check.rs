@@ -403,21 +403,27 @@ fn translate_integrity_check_impl(
                         program.emit_column_or_rowid(table_cursor_id, *pos, target);
                     }
                     BoundIndexColumn::Expr(expr) => {
-                        if let Some(jt) = table_references.joined_tables().first() {
-                            program.self_table_context =
+                        let self_table_context =
+                            if let Some(jt) = table_references.joined_tables().first() {
                                 Some(crate::vdbe::builder::SelfTableContext::ForSelect {
                                     table_ref_id: jt.internal_id,
                                     referenced_tables: table_references.clone(),
-                                });
-                        }
-                        translate_expr_no_constant_opt(
-                            program,
-                            Some(&table_references),
-                            expr,
-                            target,
-                            resolver,
-                            NoConstantOptReason::RegisterReuse,
-                        )?;
+                                })
+                            } else {
+                                None
+                            };
+
+                        program.with_self_table_context(self_table_context, |program| {
+                            translate_expr_no_constant_opt(
+                                program,
+                                Some(&table_references),
+                                expr,
+                                target,
+                                resolver,
+                                NoConstantOptReason::RegisterReuse,
+                            )?;
+                            Ok(())
+                        })?
                     }
                 }
             }

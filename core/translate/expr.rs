@@ -3201,7 +3201,6 @@ pub fn translate_expr(
 
                                 // Set up SelfTableContext so that Expr::Column { SELF_TABLE }
                                 // in the generated expression remaps to the real table reference.
-                                let saved = program.self_table_context.take();
                                 program.self_table_context = Some(SelfTableContext::ForSelect {
                                     table_ref_id: *table_ref_id,
                                     referenced_tables: referenced_tables.unwrap().clone(),
@@ -3213,7 +3212,7 @@ pub fn translate_expr(
                                     target_register,
                                     resolver,
                                 )?;
-                                program.self_table_context = saved;
+
                                 // Apply the VIRTUAL column's declared affinity to the
                                 // computed result. The expression may produce a different
                                 // type (e.g. REAL when the column is INTEGER).
