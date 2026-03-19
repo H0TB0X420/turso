@@ -868,14 +868,6 @@ fn first_update_safety_reason(
             }
         }
 
-        // Build column lookup for column_depends_on_updated
-        let column_lookup: HashMap<String, usize> = btree_table
-            .columns
-            .iter()
-            .enumerate()
-            .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
-            .collect();
-
         // Check if any index column is directly updated or transitively depends on updated columns
         if index.columns.iter().any(|c| {
             // Direct update of index column
@@ -884,13 +876,10 @@ fn first_update_safety_reason(
             }
             // Check if this is a generated column that depends on any updated column
             if btree_table.columns[c.pos_in_table].is_generated() {
-                let mut visited = HashSet::default();
                 return column_depends_on_updated(
                     c.pos_in_table,
                     &btree_table.columns,
-                    &column_lookup,
                     &updated_cols,
-                    &mut visited,
                 );
             }
             false

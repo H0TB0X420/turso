@@ -120,7 +120,6 @@ pub use io::{
     SyscallIO, WriteCompletion, IO,
 };
 pub use numeric::{nonnan::NonNan, Numeric};
-pub use schema::collect_column_refs;
 pub use statement::Statement;
 pub use storage::{
     buffer_pool::BufferPool,

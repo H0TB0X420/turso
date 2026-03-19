@@ -2452,26 +2452,24 @@ impl FromClauseSubquery {
     }
 }
 
-/// Extract all column name references from an expression as a set.
-/// Uses `walk_expr` to cover all expression types automatically.
-pub fn collect_column_refs(expr: &ast::Expr) -> HashSet<String> {
+fn collect_column_refs(expr: &Expr) -> HashSet<String> {
     collect_column_refs_with_columns(expr, &[])
 }
 
 /// Extract all column name references from an expression as a set.
 /// `columns` is used to resolve pre-resolved `Expr::Column { SELF_TABLE }` back to names.
-pub fn collect_column_refs_with_columns(expr: &ast::Expr, columns: &[Column]) -> HashSet<String> {
+pub fn collect_column_refs_with_columns(expr: &Expr, columns: &[Column]) -> HashSet<String> {
     let mut refs = HashSet::default();
     let _ = walk_expr(expr, &mut |e| match e {
-        ast::Expr::Id(name) | ast::Expr::Name(name) => {
+        Expr::Id(name) | Expr::Name(name) => {
             refs.insert(normalize_ident(name.as_str()));
             Ok(WalkControl::Continue)
         }
-        ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col) => {
+        Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
             refs.insert(normalize_ident(col.as_str()));
             Ok(WalkControl::Continue)
         }
-        ast::Expr::Column { table, column, .. } if table.is_self_table() => {
+        Expr::Column { table, column, .. } if table.is_self_table() => {
             if let Some(col) = columns.get(*column) {
                 if let Some(name) = &col.name {
                     refs.insert(normalize_ident(name));
@@ -2479,63 +2477,19 @@ pub fn collect_column_refs_with_columns(expr: &ast::Expr, columns: &[Column]) ->
             }
             Ok(WalkControl::Continue)
         }
-        ast::Expr::Subquery(_)
-        | ast::Expr::Exists(_)
-        | ast::Expr::InTable { .. }
-        | ast::Expr::SubqueryResult { .. } => Ok(WalkControl::SkipChildren),
+        Expr::Subquery(_)
+        | Expr::Exists(_)
+        | Expr::InTable { .. }
+        | Expr::SubqueryResult { .. } => Ok(WalkControl::SkipChildren),
         _ => Ok(WalkControl::Continue),
     });
     refs
 }
 
-/// Controls the DFS walk of the generated column dependency graph.
-pub enum GenColDepsAction {
-    /// Recurse into this column's dependencies.
+pub enum StoppableWalkControl {
     Recurse,
-    /// Don't recurse into this column's dependencies.
     Skip,
-    /// Stop the entire walk immediately (early termination).
     Stop,
-}
-
-/// Walks the generated column dependency graph via DFS starting from `start_idx`.
-///
-/// For each dependency encountered, calls `visitor(dep_idx, &column)`.
-/// The visitor controls traversal via `GenColDepsAction`.
-/// Cycle-safe via `visited` set. Does NOT call the visitor for the starting column itself.
-///
-/// Returns `true` if the visitor ever returned `Stop` (useful for search queries).
-pub fn walk_gen_col_deps<F>(
-    start_idx: usize,
-    columns: &[Column],
-    column_lookup: &HashMap<String, usize>,
-    visited: &mut HashSet<usize>,
-    visitor: &mut F,
-) -> bool
-where
-    F: FnMut(usize, &Column) -> GenColDepsAction,
-{
-    if !visited.insert(start_idx) {
-        return false;
-    }
-    let GeneratedType::Virtual(ref expr) = columns[start_idx].generated_type else {
-        return false;
-    };
-    for ref_name in collect_column_refs_with_columns(expr, columns) {
-        let Some(&dep_idx) = column_lookup.get(&ref_name.to_lowercase()) else {
-            continue;
-        };
-        match visitor(dep_idx, &columns[dep_idx]) {
-            GenColDepsAction::Recurse => {
-                if walk_gen_col_deps(dep_idx, columns, column_lookup, visited, visitor) {
-                    return true;
-                }
-            }
-            GenColDepsAction::Skip => {}
-            GenColDepsAction::Stop => return true,
-        }
-    }
-    false
 }
 
 /// Check if there's a path from `start` to `target` in the generated column dependency graph.
@@ -3474,7 +3428,7 @@ pub struct Column {
     pub ty_str: String,
     pub ty_params: Vec<Box<Expr>>,
     pub default: Option<Box<Expr>>,
-    pub generated_type: GeneratedType,
+    generated_type: GeneratedType,
     raw: u16,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
     pub notnull_conflict_clause: Option<ResolveType>,

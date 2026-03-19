@@ -1,7 +1,7 @@
 use crate::sync::Arc;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use crate::schema::ROWID_SENTINEL;
+use crate::schema::{collect_column_refs_with_columns, Column, GeneratedType, StoppableWalkControl, ROWID_SENTINEL};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
 use crate::translate::expression_index::expression_index_column_usage;
@@ -455,14 +455,6 @@ pub fn prepare_update_plan(
         .first()
         .expect("UPDATE must have a target table reference");
 
-    // Build column name -> index lookup for transitive dependency checking
-    let column_lookup: HashMap<String, usize> = columns
-        .iter()
-        .enumerate()
-        //TODO use normalize_ident
-        .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
-        .collect();
-
     let indexes_to_update = if rowid_alias_used {
         // If the rowid alias is used in the SET clause, we need to update all indexes
         indexes
@@ -482,13 +474,10 @@ pub fn prepare_update_plan(
                         }
                         // If column in expression is a generated column, check transitive deps
                         if columns[cidx].is_generated() {
-                            let mut visited = HashSet::default();
                             return column_depends_on_updated(
                                 cidx,
                                 columns,
-                                &column_lookup,
                                 &updated_cols,
-                                &mut visited,
                             );
                         }
                         false
@@ -503,13 +492,10 @@ pub fn prepare_update_plan(
                     // Check if this column is a generated column and if any of its
                     // dependencies are being updated. This uses transitive checking to
                     // handle chains like: generated -> VIRTUAL -> regular column.
-                    let mut visited = HashSet::default();
                     if column_depends_on_updated(
                         col.pos_in_table,
                         columns,
-                        &column_lookup,
                         &updated_cols,
-                        &mut visited,
                     ) {
                         needs = true;
                         break;
@@ -575,32 +561,78 @@ fn build_scan_op(table: &Table, iter_dir: IterationDirection) -> Operation {
 ///
 /// For example, if generated column C depends on VIRTUAL column B, which depends on
 /// regular column A, and A is in updated_cols, this returns true for C.
-///
-/// `column_lookup` maps column names (lowercased) to their indices in `columns`.
 pub fn column_depends_on_updated(
     col_idx: usize,
-    columns: &[crate::schema::Column],
-    column_lookup: &HashMap<String, usize>,
+    columns: &[Column],
     updated_cols: &HashSet<usize>,
-    visited: &mut HashSet<usize>,
 ) -> bool {
-    if updated_cols.contains(&col_idx) {
-        return true;
+    fn walk(
+        col_idx: usize,
+        columns: &[Column],
+        updated_cols: &HashSet<usize>,
+        visited: &mut HashSet<usize>,
+    ) -> bool {
+        if updated_cols.contains(&col_idx) {
+            return true;
+        }
+
+        let column_lookup: HashMap<String, usize> = columns
+            .iter()
+            .enumerate()
+            .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
+            .collect();
+
+        walk_gen_col_deps(
+            col_idx,
+            columns,
+            &column_lookup,
+            visited,
+            &mut |dep_idx, dep_col| {
+                use crate::schema::StoppableWalkControl;
+                if updated_cols.contains(&dep_idx) {
+                    StoppableWalkControl::Stop
+                } else if dep_col.is_generated() {
+                    StoppableWalkControl::Recurse
+                } else {
+                    StoppableWalkControl::Skip
+                }
+            },
+        )
     }
-    crate::schema::walk_gen_col_deps(
-        col_idx,
-        columns,
-        column_lookup,
-        visited,
-        &mut |dep_idx, dep_col| {
-            use crate::schema::GenColDepsAction;
-            if updated_cols.contains(&dep_idx) {
-                GenColDepsAction::Stop
-            } else if dep_col.is_generated() {
-                GenColDepsAction::Recurse
-            } else {
-                GenColDepsAction::Skip
+    let mut visited = HashSet::default();
+    walk(col_idx, columns, updated_cols, &mut visited)
+}
+
+/// Returns `true` if the visitor ever returned `Stop`.
+fn walk_gen_col_deps<F>(
+    start_idx: usize,
+    columns: &[Column],
+    column_lookup: &HashMap<String, usize>,
+    visited: &mut HashSet<usize>,
+    visitor: &mut F,
+) -> bool
+where
+    F: FnMut(usize, &Column) -> StoppableWalkControl,
+{
+    if !visited.insert(start_idx) {
+        return false;
+    }
+    let GeneratedType::Virtual(ref expr) = columns[start_idx].generated_type() else {
+        return false;
+    };
+    for ref_name in collect_column_refs_with_columns(expr, columns) {
+        let Some(&dep_idx) = column_lookup.get(&ref_name.to_lowercase()) else {
+            continue;
+        };
+        match visitor(dep_idx, &columns[dep_idx]) {
+            StoppableWalkControl::Recurse => {
+                if walk_gen_col_deps(dep_idx, columns, column_lookup, visited, visitor) {
+                    return true;
+                }
             }
-        },
-    )
+            StoppableWalkControl::Skip => {}
+            StoppableWalkControl::Stop => return true,
+        }
+    }
+    false
 }
