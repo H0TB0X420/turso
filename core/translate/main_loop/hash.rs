@@ -1,7 +1,8 @@
+use turso_macros::turso_assert_unreachable;
+use super::*;
 use crate::schema::GeneratedType;
 use crate::translate::emitter::HashLabels;
-
-use super::*;
+use crate::vdbe::builder::SelfTableContext;
 
 #[derive(Debug, Clone)]
 /// Payload layout metadata recorded during hash-build planning or reuse.
@@ -416,41 +417,34 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         let (payload_start_reg, mut payload_info) = if num_payload > 0 {
             let payload_reg = planner.program.alloc_registers(num_payload);
             for (i, &col_idx) in config.payload_signature_columns.iter().enumerate() {
-                if let Some(column) = build_table.columns().get(col_idx) {
-                    match column.generated_type() {
-                        GeneratedType::Virtual(expr) => {
-                            use crate::vdbe::builder::SelfTableContext;
-
-                            let saved = planner.program.self_table_context.take();
-                            planner.program.self_table_context =
-                                Some(SelfTableContext::ForSelect {
-                                    table_ref_id: build_table.internal_id,
-                                    referenced_tables: planner.table_references.clone(),
-                                });
-                            translate_expr(
-                                planner.program,
-                                Some(planner.table_references),
-                                expr,
-                                payload_reg + i,
-                                &planner.t_ctx.resolver,
-                            )?;
-                            planner.program.self_table_context = saved;
-                            let affinity = column.affinity();
-                            planner.program.emit_insn(Insn::Affinity {
-                                start_reg: payload_reg + i,
-                                count: std::num::NonZeroUsize::MIN,
-                                affinities: affinity.aff_mask().to_string(),
+                let is_virtual = match build_table.columns().get(col_idx).map(|c| c.generated_type()) {
+                    Some(GeneratedType::Virtual(expr)) => {
+                        planner.program.self_table_context =
+                            Some(SelfTableContext::ForSelect {
+                                table_ref_id: build_table.internal_id,
+                                referenced_tables: planner.table_references.clone(),
                             });
-                        }
-                        GeneratedType::NotGenerated => {
-                            planner.program.emit_column_or_rowid(
-                                payload_source_cursor_id,
-                                col_idx,
-                                payload_reg + i,
-                            );
-                        }
+                        translate_expr(
+                            planner.program,
+                            Some(planner.table_references),
+                            expr,
+                            payload_reg + i,
+                            &planner.t_ctx.resolver,
+                        )?;
+
+                        planner.program.emit_insn(Insn::Affinity {
+                            start_reg: payload_reg + i,
+                            count: std::num::NonZeroUsize::MIN,
+                            affinities: build_table.columns()[col_idx]
+                                .affinity()
+                                .aff_mask()
+                                .to_string(),
+                        });
+                        true
                     }
-                } else {
+                    Some(GeneratedType::NotGenerated) | None => false,
+                };
+                if !is_virtual {
                     planner.program.emit_column_or_rowid(
                         payload_source_cursor_id,
                         col_idx,

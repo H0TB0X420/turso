@@ -47,7 +47,6 @@ use crate::{
     },
     CaptureDataChangesExt, Connection, HashSet, Result,
 };
-use rustc_hash::FxHashMap as HashMap;
 use std::num::NonZeroUsize;
 use tracing::{instrument, Level};
 use turso_macros::{turso_assert, turso_assert_eq};
@@ -2483,33 +2482,26 @@ pub(super) fn emit_gencol_expr_from_registers(
     resolver: &Resolver,
     rowid_reg: Option<usize>,
 ) -> Result<()> {
-    let saved_context = program.self_table_context.take();
     program.self_table_context = Some(SelfTableContext::for_contiguous_regs(
         columns,
         registers_start,
         rowid_reg,
     ));
-
     translate_expr(program, None, &expr, target_reg, resolver)?;
-
-    program.self_table_context = saved_context;
     Ok(())
 }
 
-/// Describes how virtual column registers are laid out for trigger contexts.
 pub(super) enum VirtualColumnRegisters<'a> {
-    /// Contiguous registers starting at a base offset (NEW context in UPDATE).
     Contiguous {
         registers_start: usize,
         rowid_reg: Option<usize>,
     },
+    //TODO we might be able to get rid of this if we stop emitting NULL for virtual columns
     /// Non-contiguous registers indexed per column (OLD context in UPDATE).
     Indexed(&'a [usize]),
 }
 
-/// Compute VIRTUAL generated column values into their registers for trigger access during UPDATE.
-/// This is needed because VIRTUAL columns normally store NULL (computed on read),
-/// but triggers need the actual computed values in NEW/OLD contexts.
+/// Compute vircual columns into their registers for trigger access during UPDATE.
 pub(super) fn compute_virtual_columns_for_update(
     program: &mut ProgramBuilder,
     columns: &[crate::schema::Column],
@@ -2517,40 +2509,38 @@ pub(super) fn compute_virtual_columns_for_update(
     resolver: &Resolver,
 ) -> Result<()> {
     for (idx, column) in columns.iter().enumerate() {
-        if let GeneratedType::Virtual(expr) = column.generated_type() {
-            match registers {
-                VirtualColumnRegisters::Contiguous {
-                    registers_start,
-                    rowid_reg,
-                } => {
-                    let target_reg = registers_start + idx;
-                    emit_gencol_expr_from_registers(
-                        program,
-                        expr,
-                        target_reg,
-                        *registers_start,
-                        columns,
-                        resolver,
-                        *rowid_reg,
-                    )?;
-                    program.emit_column_affinity(target_reg, column.affinity());
-                }
-                VirtualColumnRegisters::Indexed(old_registers) => {
-                    let target_reg = old_registers[idx];
-                    // Build column_regs from indexed registers
-                    let column_regs = old_registers.to_vec();
+        let GeneratedType::Virtual(expr) = column.generated_type() else {
+            continue;
+        };
 
-                    let saved_context = program.self_table_context.take();
-                    program.self_table_context = Some(SelfTableContext::ForDML {
-                        column_regs,
-                        columns: columns.to_vec(),
-                    });
+        match registers {
+            VirtualColumnRegisters::Contiguous {
+                registers_start,
+                rowid_reg,
+            } => {
+                let target_reg = registers_start + idx;
+                emit_gencol_expr_from_registers(
+                    program,
+                    expr,
+                    target_reg,
+                    *registers_start,
+                    columns,
+                    resolver,
+                    *rowid_reg,
+                )?;
+                program.emit_column_affinity(target_reg, column.affinity());
+            }
+            VirtualColumnRegisters::Indexed(old_registers) => {
+                let target_reg = old_registers[idx];
+                let column_regs = old_registers.to_vec();
 
-                    translate_expr(program, None, &expr, target_reg, resolver)?;
-                    program.emit_column_affinity(target_reg, column.affinity());
+                program.self_table_context = Some(SelfTableContext::ForDML {
+                    column_regs,
+                    columns: columns.to_vec(),
+                });
 
-                    program.self_table_context = saved_context;
-                }
+                translate_expr(program, None, &expr, target_reg, resolver)?;
+                program.emit_column_affinity(target_reg, column.affinity());
             }
         }
     }

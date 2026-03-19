@@ -856,7 +856,6 @@ fn first_update_safety_reason(
             break 'requires None;
         };
 
-        // Check expression index columns against updated columns
         for (set_clause_col_idx, _) in plan.set_clauses.iter() {
             for c in index.columns.iter() {
                 if let Some(ref expr) = c.expr {

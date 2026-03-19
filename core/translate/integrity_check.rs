@@ -403,9 +403,6 @@ fn translate_integrity_check_impl(
                         program.emit_column_or_rowid(table_cursor_id, *pos, target);
                     }
                     BoundIndexColumn::Expr(expr) => {
-                        // Set up SelfTableContext for SELF_TABLE references in
-                        // virtual column expressions stored in index columns.
-                        let saved = program.self_table_context.take();
                         if let Some(jt) = table_references.joined_tables().first() {
                             program.self_table_context =
                                 Some(crate::vdbe::builder::SelfTableContext::ForSelect {
@@ -421,7 +418,6 @@ fn translate_integrity_check_impl(
                             resolver,
                             NoConstantOptReason::RegisterReuse,
                         )?;
-                        program.self_table_context = saved;
                     }
                 }
             }
