@@ -1,10 +1,7 @@
 use crate::sync::Arc;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use crate::schema::{
-    collect_column_dependencies_of_expr, Column, GeneratedType, StoppableWalkControl,
-    ROWID_SENTINEL,
-};
+use crate::schema::{collect_column_dependencies_of_expr, Column, GeneratedType, ROWID_SENTINEL};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
 use crate::translate::expression_index::expression_index_column_usage;
@@ -559,57 +556,45 @@ pub fn column_depends_on_updated(
         .filter_map(|(i, col)| col.name.as_ref().map(|name| (normalize_ident(name), i)))
         .collect();
 
-    walk_gen_col_deps(
+    depends_on_updated_recursive(
         col_idx,
         columns,
         &column_lookup,
+        updated_cols,
         &mut HashSet::default(),
-        &mut |dep_idx, dep_col| {
-            if updated_cols.contains(&dep_idx) {
-                StoppableWalkControl::Stop
-            } else if dep_col.is_generated() {
-                StoppableWalkControl::Recurse
-            } else {
-                StoppableWalkControl::Skip
-            }
-        },
     )
 }
 
-fn walk_gen_col_deps<F>(
-    start_idx: usize,
+fn depends_on_updated_recursive(
+    col_idx: usize,
     columns: &[Column],
     column_lookup: &HashMap<String, usize>,
+    updated_cols: &HashSet<usize>,
     visited: &mut HashSet<usize>,
-    visitor: &mut F,
-) -> bool
-where
-    F: FnMut(usize, &Column) -> StoppableWalkControl,
-{
-    if !visited.insert(start_idx) {
+) -> bool {
+    if !visited.insert(col_idx) {
         return false;
     }
-    match columns[start_idx].generated_type() {
-        GeneratedType::Virtual(ref expr) => {
-            for ref_name in collect_column_dependencies_of_expr(expr, columns) {
-                let Some(&dep_idx) = column_lookup.get(&ref_name.to_lowercase()) else {
-                    continue;
-                };
-                match visitor(dep_idx, &columns[dep_idx]) {
-                    StoppableWalkControl::Recurse => {
-                        if walk_gen_col_deps(dep_idx, columns, column_lookup, visited, visitor) {
-                            return true;
-                        }
-                    }
-                    StoppableWalkControl::Skip => {}
-                    StoppableWalkControl::Stop => return true,
-                }
-            }
-        }
-        GeneratedType::NotGenerated => {
-            return false;
-        }
+    let GeneratedType::Virtual(ref expr) = columns[col_idx].generated_type() else {
+        return false;
     };
 
+    for ref_name in collect_column_dependencies_of_expr(expr, columns) {
+        let Some(&dep_idx) = column_lookup.get(&ref_name.to_lowercase()) else {
+            continue;
+        };
+        if updated_cols.contains(&dep_idx)
+            || (columns[dep_idx].is_generated()
+                && depends_on_updated_recursive(
+                    dep_idx,
+                    columns,
+                    column_lookup,
+                    updated_cols,
+                    visited,
+                ))
+        {
+            return true;
+        }
+    }
     false
 }

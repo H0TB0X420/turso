@@ -2486,11 +2486,6 @@ pub fn collect_column_dependencies_of_expr(expr: &Expr, columns: &[Column]) -> H
     refs
 }
 
-pub enum StoppableWalkControl {
-    Recurse,
-    Skip,
-    Stop,
-}
 
 fn has_transitive_dependency(
     start: &str,
