@@ -1769,7 +1769,7 @@ fn bind_insert(
             values = table
                 .columns()
                 .iter()
-                .filter(|c| !c.hidden() && !c.is_generated())
+                .filter(|c| !c.hidden() && c.is_storable())
                 .map(|c| {
                     c.default.clone().unwrap_or_else(|| {
                         if let Some(type_def) = resolver.schema().get_type_def(&c.ty_str, is_strict)
@@ -2485,7 +2485,6 @@ fn translate_rows_base<'short, 'long: 'short>(
         resolver,
         is_strict,
     )?;
-
     for col in insertion.col_mappings.iter() {
         translate_column(
             program,
@@ -2502,7 +2501,7 @@ fn translate_rows_base<'short, 'long: 'short>(
 }
 
 /// Translate the [InsertionKey].
-fn translate_key<'a>(
+fn translate_key(
     program: &mut ProgramBuilder,
     insertion: &Insertion,
     mut translate_value_fn: impl FnMut(&mut ProgramBuilder, usize, usize) -> Result<()>,
@@ -2535,8 +2534,7 @@ fn translate_key<'a>(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn translate_column<'a>(
+fn translate_column(
     program: &mut ProgramBuilder,
     column: &Column,
     column_register: usize,
@@ -2560,8 +2558,8 @@ fn translate_column<'a>(
             dest_end: None,
         });
     } else if column.is_virtual_generated() {
-        // VIRTUAL generated columns are computed on read, not stored.
-        // Emit NULL as a placeholder - this register will be excluded from MakeRecord.
+        // Emit NULL as a placeholder, we compact the registers in a later pass
+        // TODO see if we can avoid placeholder/compaction
         program.emit_insn(Insn::Null {
             dest: column_register,
             dest_end: None,
@@ -2597,14 +2595,6 @@ fn translate_column<'a>(
     Ok(())
 }
 
-/// Compute VIRTUAL generated column values into their registers for trigger access.
-/// This is needed because VIRTUAL columns normally store NULL (computed on read),
-/// but triggers need the actual computed values in NEW/OLD contexts.
-///
-/// This function iterates through column mappings, finds VIRTUAL generated columns,
-/// evaluates their expressions, and applies column affinity for consistency.
-/// Build a [SelfTableContext::ForDML] from column mappings.
-/// Rowid alias columns use the rowid_alias register when provided.
 fn self_table_ctx_from_col_mappings<'a>(
     col_mappings: &[ColMapping<'a>],
     rowid_alias: Option<&ColMapping<'a>>,
@@ -2633,12 +2623,10 @@ pub fn compute_virtual_columns_for_triggers<'a>(
 ) -> Result<()> {
     for col_mapping in col_mappings {
         if let GeneratedType::Virtual(expr) = col_mapping.column.generated_type() {
-            let expr = expr.as_ref().clone();
-
             program.with_self_table_context(
                 Some(&self_table_ctx_from_col_mappings(col_mappings, rowid_alias)),
                 |program, _| {
-                    translate_expr(program, None, &expr, col_mapping.register, resolver)?;
+                    translate_expr(program, None, &*expr, col_mapping.register, resolver)?;
                     Ok(())
                 },
             )?;
@@ -3325,8 +3313,6 @@ fn emit_index_column_value_for_insert(
     dest_reg: usize,
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
-        // Resolve any Expr::Id column references to Expr::Column { SELF_TABLE }
-        // so translate_expr can handle them via SelfTableContext::Registers.
         let mut expr = expr.as_ref().clone();
         let columns: Vec<Column> = insertion
             .col_mappings

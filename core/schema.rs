@@ -2536,8 +2536,7 @@ fn has_transitive_dependency(
 }
 
 /// Resolve `Expr::Id` / `Expr::Qualified` in a generated column expression to
-/// `Expr::Column { table: SELF_TABLE, column: idx }`. This mirrors SQLite's approach
-/// of resolving column names once at schema-load time rather than at every codegen.
+/// `Expr::Column { table: SELF_TABLE, column: idx }`.
 pub fn resolve_gencol_names(expr: &mut Expr, columns: &[Column]) -> Result<()> {
     walk_expr_mut(expr, &mut |e| match e {
         Expr::Id(name) | Expr::Qualified(_, name) => {
