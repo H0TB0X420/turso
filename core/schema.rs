@@ -1,4 +1,4 @@
-use crate::function::{Deterministic, ExtFunc, Func};
+use crate::function::{Deterministic, Func};
 use crate::incremental::view::IncrementalView;
 use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
 use crate::return_if_io;
@@ -2553,21 +2553,6 @@ pub fn resolve_gencol_names(gencol_expr: &mut Expr, columns: &[Column]) -> Resul
     Ok(())
 }
 
-fn resolve_gencol_expr_function(
-    name: &Name,
-    arg_count: usize,
-) -> Result<Func> {
-    Func::resolve_function(name.as_str(), arg_count)
-}
-
-fn is_aggregate_function(func: &Func) -> bool {
-    match func {
-        Func::Agg(_) => true,
-        Func::External(ext) => matches!(&ext.as_ref().func, ExtFunc::Aggregate { .. }),
-        _ => false,
-    }
-}
-
 fn validate_generated_expr(expr: &Expr) -> Result<()> {
     use ast::Expr;
     match expr {
@@ -2591,8 +2576,9 @@ fn validate_generated_expr(expr: &Expr) -> Result<()> {
             if filter_over.over_clause.is_some() {
                 bail_parse_error!("window functions prohibited in generated columns");
             }
-            let func = resolve_gencol_expr_function(name, args.len())?;
-            if is_aggregate_function(&func) {
+            let arg_count = args.len();
+            let func = Func::resolve_function(name.as_str(), arg_count)?;
+            if matches!(func, Func::Agg(_)) {
                 bail_parse_error!("aggregate functions prohibited in generated columns");
             }
             if !func.is_deterministic() {
@@ -2607,8 +2593,8 @@ fn validate_generated_expr(expr: &Expr) -> Result<()> {
             if filter_over.over_clause.is_some() {
                 bail_parse_error!("window functions prohibited in generated columns");
             }
-            let func = resolve_gencol_expr_function(name, 0)?;
-            if is_aggregate_function(&func) {
+            let func = Func::resolve_function(name.as_str(), 0)?;
+            if matches!(func, Func::Agg(_)) {
                 bail_parse_error!("aggregate functions prohibited in generated columns");
             }
             if !func.is_deterministic() {
@@ -2909,9 +2895,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 .as_ref()
                                 .is_some_and(|t| t.as_str().eq_ignore_ascii_case("STORED"))
                             {
-                                bail_parse_error!(
-                                    "STORED generated columns are not supported"
-                                );
+                                bail_parse_error!("STORED generated columns are not supported");
                             }
                             validate_generated_expr(expr)?;
                             generated = Some(expr.clone());
@@ -3041,18 +3025,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     let current_col_name = normalize_ident(&name);
 
                     if referenced_cols.iter().any(|c| c == &current_col_name) {
-                        bail_parse_error!(
-                            "generated column \"{}\" cannot reference itself",
-                            name
-                        );
+                        bail_parse_error!("generated column \"{}\" cannot reference itself", name);
                     }
 
                     for ref_col in &referenced_cols {
-                        if has_transitive_dependency(
-                            ref_col,
-                            &current_col_name,
-                            &cols,
-                        ) {
+                        if has_transitive_dependency(ref_col, &current_col_name, &cols) {
                             bail_parse_error!(
                                 "circular dependency in generated columns \"{}\" and \"{}\"",
                                 name,
@@ -3395,15 +3372,6 @@ pub enum GeneratedType {
     NotGenerated,
 }
 
-impl GeneratedType {
-    pub fn from_expr(expr: Option<Box<Expr>>) -> Self {
-        match expr {
-            Some(expr) => Self::Virtual(expr),
-            None => Self::NotGenerated,
-        }
-    }
-}
-
 // flags
 const F_PRIMARY_KEY: u16 = 1;
 const F_ROWID_ALIAS: u16 = 2;
@@ -3503,7 +3471,10 @@ impl Column {
         col: Option<CollationSeq>,
         coldef: ColDef,
     ) -> Self {
-        let generated_type = GeneratedType::from_expr(generated);
+        let generated_type = match generated {
+            Some(expr) => GeneratedType::Virtual(expr),
+            None => GeneratedType::NotGenerated,
+        };
         let mut raw = 0u16;
         raw |= (ty as u16) << TYPE_SHIFT;
         if let Some(c) = col {
@@ -4062,22 +4033,7 @@ impl Index {
     /// Given an expression, return the position in the index if it matches an expression index column.
     /// Expression index matching is textual (after binding), so the caller should normalize the query
     /// expression to resemble the stored index expression (e.g. unqualified column names).
-    ///
-    /// NOTE: Simple column references (Id, Column, Qualified) are NOT matched here.
-    /// They should use column_table_pos_to_index_pos() instead. This prevents incorrect
-    /// matching where a VIRTUAL column's dependency expression (e.g., `b AS (c)` has
-    /// expression `c`) would incorrectly match a query for the bare column `c`.
     pub fn expression_to_index_pos(&self, expr: &Expr) -> Option<usize> {
-        // Skip simple column references - these should use column_table_pos_to_index_pos()
-        // instead of expression index matching. Expression indexes are for computed
-        // expressions like `c + 1` or `LOWER(c)`, not bare column references.
-        if matches!(
-            expr,
-            Expr::Id(_) | Expr::Column { .. } | Expr::Qualified(_, _)
-        ) {
-            return None;
-        }
-
         self.columns.iter().position(|c| {
             c.expr
                 .as_ref()

@@ -138,7 +138,6 @@ pub use turso_macros::{
     turso_assert_unreachable, turso_debug_assert, turso_soft_unreachable,
 };
 pub use types::{IOResult, Value, ValueRef};
-pub use util::rename_column_refs_in_expr;
 pub use util::IOExt;
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
