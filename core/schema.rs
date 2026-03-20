@@ -2355,7 +2355,7 @@ impl BTreeTable {
             if i == logical {
                 break;
             }
-            if col.is_storable() {
+            if !col.is_generated() {
                 physical += 1;
             }
         }
@@ -3402,10 +3402,6 @@ impl GeneratedType {
             None => Self::NotGenerated,
         }
     }
-
-    pub fn is_storable(&self) -> bool {
-        !matches!(self, GeneratedType::Virtual(_))
-    }
 }
 
 // flags
@@ -3683,11 +3679,6 @@ impl Column {
         } else {
             self.raw &= !mask
         }
-    }
-
-    /// true if the column must be stored on disk (e.g. it's not a VIRTUAL column)
-    pub fn is_storable(&self) -> bool {
-        !self.is_generated()
     }
 }
 

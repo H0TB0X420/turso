@@ -1769,7 +1769,7 @@ fn bind_insert(
             values = table
                 .columns()
                 .iter()
-                .filter(|c| !c.hidden() && c.is_storable())
+                .filter(|c| !c.hidden() && !c.is_generated())
                 .map(|c| {
                     c.default.clone().unwrap_or_else(|| {
                         if let Some(type_def) = resolver.schema().get_type_def(&c.ty_str, is_strict)
@@ -1920,7 +1920,7 @@ fn init_source_emission<'a>(
     database_id: usize,
 ) -> Result<()> {
     let required_column_count = if columns.is_empty() {
-        table.columns().iter().filter(|c| c.is_storable()).count()
+        table.columns().iter().filter(|c| !c.is_generated()).count()
     } else {
         columns.len()
     };
@@ -2115,7 +2115,7 @@ fn init_source_emission<'a>(
         }
         InsertBody::DefaultValues => {
             let insertable_columns: Vec<_> =
-                table.columns().iter().filter(|c| c.is_storable()).collect();
+                table.columns().iter().filter(|c| !c.is_generated()).collect();
             let num_values = insertable_columns.len();
             let is_strict = table.is_strict();
             values.extend(insertable_columns.iter().map(|c| {
@@ -2323,7 +2323,7 @@ fn build_insertion<'a>(
         // Case 1: No columns specified - map values to columns in order
         let insertable_count = table_columns
             .iter()
-            .filter(|c| !c.hidden() && c.is_storable())
+            .filter(|c| !c.hidden() && !c.is_generated())
             .count();
         if num_values != insertable_count {
             crate::bail_parse_error!(
