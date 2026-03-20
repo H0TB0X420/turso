@@ -732,9 +732,6 @@ fn validate(body: &ast::CreateTableBody, table_name: &str, resolver: &Resolver) 
                     ast::ColumnConstraint::Check(expr) => {
                         validate_check_expr(expr, table_name, &column_names, resolver)?;
                     }
-                    ast::ColumnConstraint::Generated { .. } => {
-                        // Generated columns are supported - validation is done in core/schema.rs
-                    }
                     ast::ColumnConstraint::Default(expr) => {
                         let expr =
                             translate_ident_to_string_literal(expr).unwrap_or_else(|| expr.clone());

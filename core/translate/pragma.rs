@@ -1361,7 +1361,6 @@ fn emit_columns_for_table_info(
             // hidden column in virtual table
             1
         } else if column.is_virtual_generated() {
-            // VIRTUAL (dynamic) generated column
             2
         } else {
             // normal column

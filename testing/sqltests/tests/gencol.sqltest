@@ -2306,3 +2306,320 @@ expect {
     a
     b
 }
+
+# =============================================================================
+# validate_generated_expr branch coverage tests
+# =============================================================================
+
+# --- Top-level expression branches ---
+
+# CAST in generated column expression
+test gencol_validate_cast {
+    CREATE TABLE t1(a INTEGER, b AS (CAST(a AS TEXT)));
+    INSERT INTO t1(a) VALUES(42);
+    SELECT typeof(b), b FROM t1;
+}
+expect {
+    text|42
+}
+
+# Parenthesized expression at top level (double parens)
+test gencol_validate_parenthesized {
+    CREATE TABLE t1(a INTEGER, b AS ((a + 1)));
+    INSERT INTO t1(a) VALUES(5);
+    SELECT b FROM t1;
+}
+expect {
+    6
+}
+
+# COLLATE in generated column expression
+test gencol_validate_collate {
+    CREATE TABLE t1(a TEXT, b AS (a COLLATE NOCASE));
+    INSERT INTO t1(a) VALUES('Hello');
+    SELECT b FROM t1;
+}
+expect {
+    Hello
+}
+
+# ISNULL keyword in generated column expression (Expr::IsNull variant)
+# Note: "a IS NULL" parses as Binary(a, Is, NULL), not IsNull.
+# "a ISNULL" uses the ISNULL keyword which produces Expr::IsNull.
+test gencol_validate_isnull {
+    CREATE TABLE t1(a INTEGER, b AS (a ISNULL));
+    INSERT INTO t1(a) VALUES(NULL), (5);
+    SELECT a, b FROM t1;
+}
+expect {
+    |1
+    5|0
+}
+
+# NOTNULL keyword in generated column expression (Expr::NotNull variant)
+# Note: "a IS NOT NULL" parses as Binary(a, IsNot, NULL), not NotNull.
+# "a NOTNULL" uses the NOTNULL keyword which produces Expr::NotNull.
+test gencol_validate_notnull {
+    CREATE TABLE t1(a INTEGER, b AS (a NOTNULL));
+    INSERT INTO t1(a) VALUES(NULL), (5);
+    SELECT a, b FROM t1;
+}
+expect {
+    |0
+    5|1
+}
+
+# LIKE with ESCAPE in generated column expression
+test gencol_validate_like_escape {
+    CREATE TABLE t1(a TEXT, b AS (a LIKE '%!%%' ESCAPE '!'));
+    INSERT INTO t1(a) VALUES('100%'), ('hello'), ('50% off');
+    SELECT a, b FROM t1;
+}
+expect {
+    100%|1
+    hello|0
+    50% off|1
+}
+
+# --- Error: subquery variants in generated column ---
+
+# IN (SELECT ...) prohibited in generated column
+test gencol_error_in_select {
+    CREATE TABLE t2(x INTEGER);
+    CREATE TABLE t1(a INTEGER, b AS (a IN (SELECT x FROM t2)));
+}
+expect error {
+    subqueries prohibited in generated columns
+}
+
+# EXISTS prohibited in generated column
+test gencol_error_exists {
+    CREATE TABLE t2(x INTEGER);
+    CREATE TABLE t1(a INTEGER, b AS (EXISTS(SELECT 1 FROM t2)));
+}
+expect error {
+    subqueries prohibited in generated columns
+}
+
+# --- Error: aggregate star function (count(*)) ---
+
+test gencol_error_aggregate_star {
+    CREATE TABLE t1(a INTEGER, b AS (count(*)));
+}
+expect error {
+    aggregate functions prohibited in generated columns
+}
+
+# --- Recursive validation: nested prohibited constructs ---
+
+# Subquery nested inside a function argument
+test gencol_error_nested_subquery_in_func {
+    CREATE TABLE t2(x INTEGER);
+    CREATE TABLE t1(a INTEGER, b AS (ABS((SELECT x FROM t2))));
+}
+expect error {
+    subqueries prohibited in generated columns
+}
+
+# Aggregate nested inside arithmetic expression
+test gencol_error_nested_aggregate {
+    CREATE TABLE t1(a INTEGER, b AS (a + sum(a)));
+}
+expect error {
+    aggregate functions prohibited in generated columns
+}
+
+# Non-deterministic function nested inside arithmetic
+test gencol_error_nested_nondeterministic {
+    CREATE TABLE t1(a INTEGER, b AS (a + random()));
+}
+expect error {
+    non-deterministic functions prohibited in generated columns
+}
+
+# Dot operator nested inside a CASE expression
+test gencol_error_nested_dot_in_case {
+    CREATE TABLE t1(a INTEGER, b AS (CASE WHEN a > 0 THEN t1.a ELSE 0 END));
+}
+expect error {
+    the "." operator prohibited in generated columns
+}
+
+# Subquery nested inside CASE WHEN condition
+test gencol_error_nested_subquery_in_case {
+    CREATE TABLE t2(x INTEGER);
+    CREATE TABLE t1(a INTEGER, b AS (CASE WHEN (SELECT 1 FROM t2) THEN a ELSE 0 END));
+}
+expect error {
+    subqueries prohibited in generated columns
+}
+
+# Cast wrapping a valid expression (tests recursive Cast branch)
+test gencol_validate_nested_cast {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (ABS(CAST(a AS REAL)) + b));
+    INSERT INTO t1(a, b) VALUES(-5, 3);
+    SELECT c FROM t1;
+}
+expect {
+    8.0
+}
+
+# IS NULL nested inside a binary expression
+test gencol_validate_nested_isnull {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (CASE WHEN a IS NULL THEN b ELSE a END));
+    INSERT INTO t1(a, b) VALUES(NULL, 99), (5, 99);
+    SELECT c FROM t1;
+}
+expect {
+    99
+    5
+}
+
+# InList nested inside CASE
+test gencol_validate_nested_inlist {
+    CREATE TABLE t1(a INTEGER, b AS (CASE WHEN a IN (1, 2, 3) THEN 'low' ELSE 'high' END));
+    INSERT INTO t1(a) VALUES(2), (10);
+    SELECT a, b FROM t1;
+}
+expect {
+    2|low
+    10|high
+}
+
+# Between nested inside a binary expression
+test gencol_validate_nested_between {
+    CREATE TABLE t1(a INTEGER, b AS ((a BETWEEN 1 AND 10) + 0));
+    INSERT INTO t1(a) VALUES(5), (15);
+    SELECT a, b FROM t1;
+}
+expect {
+    5|1
+    15|0
+}
+
+# Like nested inside CASE
+test gencol_validate_nested_like {
+    CREATE TABLE t1(a TEXT, b AS (CASE WHEN a LIKE '%hello%' THEN 1 ELSE 0 END));
+    INSERT INTO t1(a) VALUES('say hello'), ('goodbye');
+    SELECT a, b FROM t1;
+}
+expect {
+    say hello|1
+    goodbye|0
+}
+
+# Collate nested inside a binary expression
+test gencol_validate_nested_collate {
+    CREATE TABLE t1(a TEXT, b TEXT, c AS ((a COLLATE NOCASE) = b));
+    INSERT INTO t1(a, b) VALUES('Hello', 'hello'), ('World', 'earth');
+    SELECT a, b, c FROM t1;
+}
+expect {
+    Hello|hello|1
+    World|earth|0
+}
+
+# --- Additional recursive validation tests ---
+
+# IN (SELECT ...) nested in CASE - tests REC InSelect
+test gencol_error_nested_in_select {
+    CREATE TABLE t2(x INTEGER);
+    CREATE TABLE t1(a INTEGER, b AS (CASE WHEN a IN (SELECT x FROM t2) THEN 1 ELSE 0 END));
+}
+expect error {
+    subqueries prohibited in generated columns
+}
+
+# EXISTS nested inside arithmetic - tests REC Exists
+test gencol_error_nested_exists_in_arith {
+    CREATE TABLE t2(x INTEGER);
+    CREATE TABLE t1(a INTEGER, b AS (a + EXISTS(SELECT 1 FROM t2)));
+}
+expect error {
+    subqueries prohibited in generated columns
+}
+
+# count(*) nested inside arithmetic - tests REC FunctionCallStar
+test gencol_error_nested_aggregate_star {
+    CREATE TABLE t1(a INTEGER, b AS (a + count(*)));
+}
+expect error {
+    aggregate functions prohibited in generated columns
+}
+
+# LIKE with ESCAPE nested inside CASE - tests REC Like escape
+test gencol_validate_nested_like_escape {
+    CREATE TABLE t1(a TEXT, b AS (CASE WHEN a LIKE '%!%%' ESCAPE '!' THEN 1 ELSE 0 END));
+    INSERT INTO t1(a) VALUES('100%'), ('hello');
+    SELECT a, b FROM t1;
+}
+expect {
+    100%|1
+    hello|0
+}
+
+# ISNULL nested inside arithmetic - tests REC IsNull
+test gencol_validate_nested_isnull_arith {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (b + (a ISNULL)));
+    INSERT INTO t1(a, b) VALUES(NULL, 10), (5, 10);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    |10|11
+    5|10|10
+}
+
+# NOTNULL nested inside arithmetic - tests REC NotNull
+test gencol_validate_nested_notnull_arith {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (b + (a NOTNULL)));
+    INSERT INTO t1(a, b) VALUES(NULL, 10), (5, 10);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    |10|10
+    5|10|11
+}
+
+# DoublyQualified (schema.table.column) at top level - entire expr is just the reference
+test gencol_error_doubly_qualified {
+    CREATE TABLE t1(a INTEGER, b AS (main.t1.a));
+}
+expect error {
+    the "." operator prohibited in generated columns
+}
+
+# DoublyQualified nested inside function - tests REC DoublyQualified
+test gencol_error_nested_doubly_qualified {
+    CREATE TABLE t1(a INTEGER, b AS (ABS(main.t1.a)));
+}
+expect error {
+    the "." operator prohibited in generated columns
+}
+
+# Window function at top level - tests TOP FunctionCall window
+test gencol_error_window_function {
+    CREATE TABLE t1(a INTEGER, b AS (sum(a) OVER ()));
+}
+expect error {
+    window functions prohibited in generated columns
+}
+
+# Window function nested inside arithmetic - tests REC FunctionCall window
+test gencol_error_nested_window_function {
+    CREATE TABLE t1(a INTEGER, b AS (a + sum(a) OVER ()));
+}
+expect error {
+    window functions prohibited in generated columns
+}
+
+# CASE base form nested inside arithmetic - tests REC Case base sub-branch
+test gencol_validate_nested_case_base {
+    CREATE TABLE t1(a INTEGER, b AS (10 + CASE a WHEN 1 THEN 100 WHEN 2 THEN 200 ELSE 300 END));
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    SELECT a, b FROM t1;
+}
+expect {
+    1|110
+    2|210
+    3|310
+}

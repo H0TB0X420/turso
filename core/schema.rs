@@ -2492,10 +2492,6 @@ pub enum StoppableWalkControl {
     Stop,
 }
 
-/// Check if there's a path from `start` to `target` in the generated column dependency graph.
-/// Uses DFS with cycle detection to find transitive dependencies.
-/// `columns` is the list of columns seen so far during parsing.
-/// Returns true if target is reachable from start through generated column dependencies.
 fn has_transitive_dependency(
     start: &str,
     target: &str,
@@ -2503,29 +2499,25 @@ fn has_transitive_dependency(
     visited: &mut std::collections::HashSet<String>,
 ) -> bool {
     if !visited.insert(start.to_owned()) {
-        return false; // Already visited this node, no cycle through here
+        return false;
     }
 
-    // Find the column with this name
     let col = columns.iter().find(|c| c.name.as_deref() == Some(start));
 
     let Some(col) = col else {
-        return false; // Not a generated column or doesn't exist yet
+        return false;
     };
 
     let GeneratedType::Virtual(ref gen_expr) = col.generated_type else {
-        return false; // Not a generated column
+        return false;
     };
 
-    // Extract dependencies of this column
     let deps = collect_column_refs(gen_expr);
 
-    // Check if target is directly referenced
     if deps.contains(target) {
         return true;
     }
 
-    // Recursively check transitive dependencies
     for dep in deps {
         if has_transitive_dependency(&dep, target, columns, visited) {
             return true;
@@ -2535,10 +2527,10 @@ fn has_transitive_dependency(
     false
 }
 
-/// Resolve `Expr::Id` / `Expr::Qualified` in a generated column expression to
+/// Resolve [Expr::Id] / [Expr::Qualified] in a generated column expression to
 /// `Expr::Column { table: SELF_TABLE, column: idx }`.
-pub fn resolve_gencol_names(expr: &mut Expr, columns: &[Column]) -> Result<()> {
-    walk_expr_mut(expr, &mut |e| match e {
+pub fn resolve_gencol_names(gencol_expr: &mut Expr, columns: &[Column]) -> Result<()> {
+    walk_expr_mut(gencol_expr, &mut |e| match e {
         Expr::Id(name) | Expr::Qualified(_, name) => {
             let col_name = normalize_ident(name.as_str());
             let (idx, col) = columns
@@ -2550,7 +2542,7 @@ pub fn resolve_gencol_names(expr: &mut Expr, columns: &[Column]) -> Result<()> {
                         .is_some_and(|n| n.eq_ignore_ascii_case(&col_name))
                 })
                 .ok_or_else(|| {
-                    crate::LimboError::ParseError(format!("no such column: {col_name}"))
+                    LimboError::ParseError(format!("no such column: {col_name}"))
                 })?;
             *e = Expr::Column {
                 database: None,
@@ -2567,7 +2559,7 @@ pub fn resolve_gencol_names(expr: &mut Expr, columns: &[Column]) -> Result<()> {
 
 fn resolve_generated_expr_function(
     resolver: Option<&Resolver>,
-    name: &ast::Name,
+    name: &Name,
     arg_count: usize,
 ) -> Result<Func> {
     if let Some(resolver) = resolver {
@@ -2586,79 +2578,68 @@ fn is_aggregate_function(func: &Func) -> bool {
     }
 }
 
-/// Validates generated column expression for prohibited constructs.
-/// SQLite prohibits: subqueries, aggregate functions, window functions,
-/// and non-deterministic functions in generated columns.
-pub(crate) fn validate_generated_expr(expr: &ast::Expr, resolver: Option<&Resolver>) -> Result<()> {
-    validate_generated_expr_recursive(expr, resolver)
-}
-
-fn validate_generated_expr_recursive(expr: &ast::Expr, resolver: Option<&Resolver>) -> Result<()> {
+fn validate_generated_expr(expr: &Expr, resolver: Option<&Resolver>) -> Result<()> {
     use ast::Expr;
     match expr {
-        // Qualified column references prohibited (e.g. t.a or db.t.a)
-        Expr::Qualified(_, _) | Expr::DoublyQualified(_, _, _) => {
-            crate::bail_parse_error!("the \".\" operator prohibited in generated columns");
+        Expr::Qualified(_, _) => {
+            bail_parse_error!("the \".\" operator prohibited in generated columns");
+        }
+        Expr::DoublyQualified(_, _, _) => {
+            bail_parse_error!("the \".\" operator prohibited in generated columns");
         }
 
-        // Subqueries prohibited (including InTable which is a table-valued subquery)
         Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_) | Expr::InTable { .. } => {
-            crate::bail_parse_error!("subqueries prohibited in generated columns");
+            bail_parse_error!("subqueries prohibited in generated columns");
         }
 
-        // Check function calls
         Expr::FunctionCall {
             name,
             args,
             filter_over,
             ..
         } => {
-            // Window functions prohibited
             if filter_over.over_clause.is_some() {
-                crate::bail_parse_error!("window functions prohibited in generated columns");
+                bail_parse_error!("window functions prohibited in generated columns");
             }
-
             let func = resolve_generated_expr_function(resolver, name, args.len())?;
             if is_aggregate_function(&func) {
-                crate::bail_parse_error!("aggregate functions prohibited in generated columns");
+                bail_parse_error!("aggregate functions prohibited in generated columns");
             }
             if !func.is_deterministic() {
-                crate::bail_parse_error!(
+                bail_parse_error!(
                     "non-deterministic functions prohibited in generated columns"
                 );
             }
-
-            // Recurse into arguments
             for arg in args {
-                validate_generated_expr_recursive(arg, resolver)?;
+                validate_generated_expr(arg, resolver)?;
             }
         }
 
-        // Check for aggregate star function
         Expr::FunctionCallStar { name, filter_over } => {
             if filter_over.over_clause.is_some() {
-                crate::bail_parse_error!("window functions prohibited in generated columns");
+                bail_parse_error!("window functions prohibited in generated columns");
             }
             let func = resolve_generated_expr_function(resolver, name, 0)?;
             if is_aggregate_function(&func) {
-                crate::bail_parse_error!("aggregate functions prohibited in generated columns");
+                bail_parse_error!("aggregate functions prohibited in generated columns");
             }
             if !func.is_deterministic() {
-                crate::bail_parse_error!(
+                bail_parse_error!(
                     "non-deterministic functions prohibited in generated columns"
                 );
             }
         }
 
-        // Recurse into child expressions
         Expr::Binary(lhs, _, rhs) => {
-            validate_generated_expr_recursive(lhs, resolver)?;
-            validate_generated_expr_recursive(rhs, resolver)?;
+            validate_generated_expr(lhs, resolver)?;
+            validate_generated_expr(rhs, resolver)?;
         }
-        Expr::Unary(_, inner) => validate_generated_expr_recursive(inner, resolver)?,
+        Expr::Unary(_, inner) => {
+            validate_generated_expr(inner, resolver)?;
+        },
         Expr::Parenthesized(exprs) => {
             for e in exprs {
-                validate_generated_expr_recursive(e, resolver)?;
+                validate_generated_expr(e, resolver)?;
             }
         }
         Expr::Case {
@@ -2668,50 +2649,53 @@ fn validate_generated_expr_recursive(expr: &ast::Expr, resolver: Option<&Resolve
             ..
         } => {
             if let Some(b) = base {
-                validate_generated_expr_recursive(b, resolver)?;
+                validate_generated_expr(b, resolver)?;
             }
             for (w, t) in when_then_pairs {
-                validate_generated_expr_recursive(w, resolver)?;
-                validate_generated_expr_recursive(t, resolver)?;
+                validate_generated_expr(w, resolver)?;
+                validate_generated_expr(t, resolver)?;
             }
             if let Some(e) = else_expr {
-                validate_generated_expr_recursive(e, resolver)?;
+                validate_generated_expr(e, resolver)?;
             }
         }
-        Expr::Cast { expr, .. } => validate_generated_expr_recursive(expr, resolver)?,
+        Expr::Cast { expr, .. } => {
+            validate_generated_expr(expr, resolver)?;
+        },
         Expr::InList { lhs, rhs, .. } => {
-            validate_generated_expr_recursive(lhs, resolver)?;
+            validate_generated_expr(lhs, resolver)?;
             for e in rhs {
-                validate_generated_expr_recursive(e, resolver)?;
+                validate_generated_expr(e, resolver)?;
             }
         }
         Expr::Between {
             lhs, start, end, ..
         } => {
-            validate_generated_expr_recursive(lhs, resolver)?;
-            validate_generated_expr_recursive(start, resolver)?;
-            validate_generated_expr_recursive(end, resolver)?;
+            validate_generated_expr(lhs, resolver)?;
+            validate_generated_expr(start, resolver)?;
+            validate_generated_expr(end, resolver)?;
         }
         Expr::Like {
             lhs, rhs, escape, ..
         } => {
-            validate_generated_expr_recursive(lhs, resolver)?;
-            validate_generated_expr_recursive(rhs, resolver)?;
+            validate_generated_expr(lhs, resolver)?;
+            validate_generated_expr(rhs, resolver)?;
             if let Some(e) = escape {
-                validate_generated_expr_recursive(e, resolver)?;
+                validate_generated_expr(e, resolver)?;
             }
         }
-        Expr::Collate(inner, _) => validate_generated_expr_recursive(inner, resolver)?,
+        Expr::Collate(inner, _) => {
+            validate_generated_expr(inner, resolver)?;
+        },
         Expr::IsNull(inner) | Expr::NotNull(inner) => {
-            validate_generated_expr_recursive(inner, resolver)?;
+            validate_generated_expr(inner, resolver)?;
         }
-        // Other expressions are allowed
         _ => {}
     }
     Ok(())
 }
 
-pub fn create_table(
+pub fn create_table( //TODO I don't like this Option argument...
     tbl_name: &str,
     body: &CreateTableBody,
     root_page: i64,
@@ -3100,6 +3084,7 @@ pub fn create_table(
                     // For each referenced column that is also a generated column,
                     // check if it can transitively reach back to the current column
                     for ref_col in &referenced_cols {
+                        //TODO this is ugly, hide the set creation
                         let mut visited = std::collections::HashSet::new();
                         if has_transitive_dependency(
                             ref_col,

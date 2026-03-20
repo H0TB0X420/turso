@@ -318,9 +318,8 @@ pub fn prepare_update_plan(
 
             let col_index = match column_lookup.get(&ident) {
                 Some(idx) => {
-                    // Check if this is a generated column - cannot update directly
-                    let col = &table.columns()[*idx];
-                    col.ensure_not_generated("UPDATE", col_name.as_str())?;
+                    // cannot update generated columns directly
+                    (&table.columns()[*idx]).ensure_not_generated("UPDATE", col_name.as_str())?;
                     *idx
                 }
                 None => {
@@ -392,8 +391,6 @@ pub fn prepare_update_plan(
         }
     }
 
-    // Note: generated columns are computed on read (VIRTUAL) so no recomputation needed here
-
     // Plan subqueries in RETURNING expressions before processing
     // (so SubqueryResult nodes are cloned into result_columns)
     let mut non_from_clause_subqueries = vec![];
@@ -444,53 +441,47 @@ pub fn prepare_update_plan(
         .limit
         .map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
 
-    // Check what indexes will need to be updated by checking set_clauses and see
-    // if a column is contained in an index.
+    // Determine which indexes need updating
     let indexes: Vec<_> = resolver.with_schema(database_id, |s| {
         s.get_indices(table_name).cloned().collect()
     });
-    let updated_cols: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
     let rowid_alias_used = set_clauses
         .iter()
         .any(|(idx, _)| *idx == ROWID_SENTINEL || columns[*idx].is_rowid_alias());
-    let target_table_ref = table_references
-        .joined_tables()
-        .first()
-        .expect("UPDATE must have a target table reference");
-
     let indexes_to_update = if rowid_alias_used {
         // If the rowid alias is used in the SET clause, we need to update all indexes
         indexes
     } else {
-        // or if the columns used in the partial index WHERE clause are being updated,
-        // or if any dependencies of a generated column are being updated (transitively)
+        let updated_cols: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
+        let target_table_ref = table_references
+            .joined_tables()
+            .first()
+            .expect("UPDATE must have a target table reference");
         let mut indexes_to_update = Vec::new();
+
+        // else, we update indexes that match certain conditions
         for idx in indexes {
             let mut needs = false;
             for col in idx.columns.iter() {
                 if let Some(expr) = col.expr.as_ref() {
                     let cols_used =
                         expression_index_column_usage(expr.as_ref(), target_table_ref, resolver)?;
+
                     if cols_used.iter().any(|cidx| {
-                        if updated_cols.contains(&cidx) {
-                            return true;
-                        }
-                        // If column in expression is a generated column, check transitive deps
-                        if columns[cidx].is_generated() {
-                            return column_depends_on_updated(cidx, columns, &updated_cols);
-                        }
-                        false
+                        // the expression of an expression index uses an updated column
+                        updated_cols.contains(&cidx)
+                            || (columns[cidx].is_generated()
+                                && column_depends_on_updated(cidx, columns, &updated_cols))
                     }) {
                         needs = true;
                         break;
                     }
                 } else if updated_cols.contains(&col.pos_in_table) {
+                    // an indexed column is updated
                     needs = true;
                     break;
                 } else if columns[col.pos_in_table].is_generated() {
-                    // Check if this column is a generated column and if any of its
-                    // dependencies are being updated. This uses transitive checking to
-                    // handle chains like: generated -> VIRTUAL -> regular column.
+                    // the index has a generated column that depends on an updated column
                     if column_depends_on_updated(col.pos_in_table, columns, &updated_cols) {
                         needs = true;
                         break;
@@ -552,53 +543,39 @@ fn build_scan_op(table: &Table, iter_dir: IterationDirection) -> Operation {
 }
 
 /// Checks if a column transitively depends on any column in the updated_cols set.
-/// This follows through VIRTUAL column chains to find the underlying dependencies.
-///
-/// For example, if generated column C depends on VIRTUAL column B, which depends on
-/// regular column A, and A is in updated_cols, this returns true for C.
+/// For example, in `CREATE TABLE t(a, b as (a + 1), c as (b * 2))`, `b` and `c` both depend on `a`.
 pub fn column_depends_on_updated(
     col_idx: usize,
     columns: &[Column],
     updated_cols: &HashSet<usize>,
 ) -> bool {
-    fn walk(
-        col_idx: usize,
-        columns: &[Column],
-        updated_cols: &HashSet<usize>,
-        visited: &mut HashSet<usize>,
-    ) -> bool {
-        if updated_cols.contains(&col_idx) {
-            return true;
-        }
-
-        let column_lookup: HashMap<String, usize> = columns
-            .iter()
-            .enumerate()
-            .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
-            .collect();
-
-        walk_gen_col_deps(
-            col_idx,
-            columns,
-            &column_lookup,
-            visited,
-            &mut |dep_idx, dep_col| {
-                use crate::schema::StoppableWalkControl;
-                if updated_cols.contains(&dep_idx) {
-                    StoppableWalkControl::Stop
-                } else if dep_col.is_generated() {
-                    StoppableWalkControl::Recurse
-                } else {
-                    StoppableWalkControl::Skip
-                }
-            },
-        )
+    if updated_cols.contains(&col_idx) {
+        return true;
     }
-    let mut visited = HashSet::default();
-    walk(col_idx, columns, updated_cols, &mut visited)
+
+    let column_lookup: HashMap<String, usize> = columns
+        .iter()
+        .enumerate()
+        .filter_map(|(i, col)| col.name.as_ref().map(|name| (normalize_ident(name), i)))
+        .collect();
+
+    walk_gen_col_deps(
+        col_idx,
+        columns,
+        &column_lookup,
+        &mut HashSet::default(),
+        &mut |dep_idx, dep_col| {
+            if updated_cols.contains(&dep_idx) {
+                StoppableWalkControl::Stop
+            } else if dep_col.is_generated() {
+                StoppableWalkControl::Recurse
+            } else {
+                StoppableWalkControl::Skip
+            }
+        },
+    )
 }
 
-/// Returns `true` if the visitor ever returned `Stop`.
 fn walk_gen_col_deps<F>(
     start_idx: usize,
     columns: &[Column],
@@ -612,22 +589,27 @@ where
     if !visited.insert(start_idx) {
         return false;
     }
-    let GeneratedType::Virtual(ref expr) = columns[start_idx].generated_type() else {
-        return false;
-    };
-    for ref_name in collect_column_dependencies_of_expr(expr, columns) {
-        let Some(&dep_idx) = column_lookup.get(&ref_name.to_lowercase()) else {
-            continue;
-        };
-        match visitor(dep_idx, &columns[dep_idx]) {
-            StoppableWalkControl::Recurse => {
-                if walk_gen_col_deps(dep_idx, columns, column_lookup, visited, visitor) {
-                    return true;
+    match columns[start_idx].generated_type() {
+        GeneratedType::Virtual(ref expr) => {
+            for ref_name in collect_column_dependencies_of_expr(expr, columns) {
+                let Some(&dep_idx) = column_lookup.get(&ref_name.to_lowercase()) else {
+                    continue;
+                };
+                match visitor(dep_idx, &columns[dep_idx]) {
+                    StoppableWalkControl::Recurse => {
+                        if walk_gen_col_deps(dep_idx, columns, column_lookup, visited, visitor) {
+                            return true;
+                        }
+                    }
+                    StoppableWalkControl::Skip => {}
+                    StoppableWalkControl::Stop => return true,
                 }
             }
-            StoppableWalkControl::Skip => {}
-            StoppableWalkControl::Stop => return true,
         }
-    }
+        GeneratedType::NotGenerated => {
+            return false;
+        }
+    };
+
     false
 }

@@ -241,7 +241,7 @@ pub struct ProgramBuilder {
     /// Maps table internal_id to result_columns_start_reg for FROM clause subqueries.
     /// Used when nested subqueries need to reference columns from outer query subqueries.
     subquery_result_regs: HashMap<TableInternalId, usize>,
-    /// Context for resolving Expr::Column with [TableInternalId::SELF_TABLE].
+    /// Context for resolving an Expr::Column that has the [TableInternalId::SELF_TABLE] placeholder.
     self_table_context: Option<SelfTableContext>,
     /// Counter for CTE identity tracking. Each CTE definition gets a unique ID
     /// so that multiple references to the same CTE can share materialized data.
