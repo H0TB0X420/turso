@@ -105,20 +105,16 @@ impl CursorKey {
     }
 }
 
-/// Context for resolving `Expr::Column` with `TableInternalId::SELF_TABLE`.
-/// Set during generated column evaluation, `None` otherwise.
+/// Context for resolving `Expr::Column` that has a `TableInternalId::SELF_TABLE` plaheholder.
 #[derive(Clone)]
 pub enum SelfTableContext {
-    /// SELECT path: remap SELF_TABLE to this real table reference.
     ForSelect {
         table_ref_id: TableInternalId,
         referenced_tables: TableReferences,
     },
-    /// INSERT/UPDATE path: column values live in registers.
     ForDML {
         /// column_index → register
         column_regs: Vec<usize>,
-        /// Column metadata (needed to detect nested virtual columns)
         columns: Vec<Column>,
     },
 }
@@ -241,7 +237,7 @@ pub struct ProgramBuilder {
     /// Maps table internal_id to result_columns_start_reg for FROM clause subqueries.
     /// Used when nested subqueries need to reference columns from outer query subqueries.
     subquery_result_regs: HashMap<TableInternalId, usize>,
-    /// Context for resolving an Expr::Column that has the [TableInternalId::SELF_TABLE] placeholder.
+    /// Context for resolving an Expr::Column that has a [TableInternalId::SELF_TABLE] placeholder.
     self_table_context: Option<SelfTableContext>,
     /// Counter for CTE identity tracking. Each CTE definition gets a unique ID
     /// so that multiple references to the same CTE can share materialized data.
@@ -1638,7 +1634,7 @@ impl ProgramBuilder {
         let (_, cursor_type) = self.cursor_ref.get(cursor_id).expect("cursor_id is valid");
 
         match cursor_type {
-            CursorType::BTreeTable(btree) | CursorType::MaterializedView(btree, _) => {
+            CursorType::BTreeTable(btree) => {
                 let column_def = btree
                     .columns
                     .get(column)
@@ -1652,24 +1648,15 @@ impl ProgramBuilder {
             _ => {}
         }
 
-        // Compute physical column index by skipping VIRTUAL generated columns
-        // (since they are not stored in the record)
         let physical_column = match cursor_type {
             CursorType::BTreeTable(btree) => btree.logical_to_physical_column(column),
-            CursorType::MaterializedView(btree, _) => btree.logical_to_physical_column(column),
-            _ => column, // For indexes and other cursor types, use logical column
+            _ => column,
         };
 
         let default = 'value: {
             let default = match cursor_type {
                 CursorType::BTreeTable(btree) => &btree.columns[column].default,
-                CursorType::BTreeIndex(index) => {
-                    // Find the IndexColumn with matching pos_in_table, or break with None
-                    match index.columns.iter().find(|ic| ic.pos_in_table == column) {
-                        Some(ic) => &ic.default,
-                        None => break 'value None,
-                    }
-                }
+                CursorType::BTreeIndex(index) => &index.columns[column].default,
                 CursorType::MaterializedView(btree, _) => &btree.columns[column].default,
                 _ => break 'value None,
             };
@@ -1787,9 +1774,7 @@ impl ProgramBuilder {
         &mut self,
         f: impl FnOnce(&mut ProgramBuilder, Option<&SelfTableContext>) -> crate::Result<T>,
     ) -> crate::Result<T> {
-        let self_table_context = self.self_table_context.clone();
-        let result = f(self, self_table_context.as_ref())?;
-        self.self_table_context = self_table_context;
+        let result = f(self, self.self_table_context.clone().as_ref())?;
         Ok(result)
     }
 
@@ -1799,7 +1784,7 @@ impl ProgramBuilder {
         f: impl FnOnce(&mut ProgramBuilder, Option<&SelfTableContext>) -> crate::Result<T>,
     ) -> crate::Result<T> {
         let prev = self.self_table_context.take();
-        self.self_table_context = ctx.cloned();
+        self.self_table_context = ctx.cloned(); //TODO can we avoid the clone?
         let result = f(self, ctx);
         self.self_table_context = prev;
         result

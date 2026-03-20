@@ -2992,11 +2992,7 @@ pub fn translate_expr(
                         match col.generated_type() {
                             GeneratedType::Virtual(gen_expr) => {
                                 translate_expr(program, None, gen_expr, target_register, resolver)?;
-                                program.emit_insn(Insn::Affinity {
-                                    start_reg: target_register,
-                                    count: std::num::NonZeroUsize::MIN,
-                                    affinities: col.affinity().aff_mask().to_string(),
-                                });
+                                program.emit_column_affinity(target_register, col.affinity());
                                 return Ok(target_register);
                             }
                             GeneratedType::NotGenerated => {
@@ -3202,11 +3198,7 @@ pub fn translate_expr(
                                     },
                                 )?;
 
-                                program.emit_insn(Insn::Affinity {
-                                    start_reg: target_register,
-                                    count: std::num::NonZeroUsize::MIN,
-                                    affinities: table_column.affinity().aff_mask().to_string(),
-                                });
+                                program.emit_column_affinity(target_register, table_column.affinity());
                             }
                             _ => {
                                 let read_cursor = if read_from_index {

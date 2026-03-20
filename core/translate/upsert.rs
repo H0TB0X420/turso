@@ -411,8 +411,7 @@ pub fn emit_upsert(
     let current_start = program.alloc_registers(num_cols);
     for (i, col) in ctx.table.columns.iter().enumerate() {
         if col.is_virtual_generated() {
-            // VIRTUAL columns are not stored in the record — emit NULL.
-            // Their values are computed on-the-fly when needed.
+            //TODO see if we can avoid emitting null and later compacting the registers
             program.emit_insn(Insn::Null {
                 dest: current_start + i,
                 dest_end: None,
@@ -551,7 +550,7 @@ pub fn emit_upsert(
             program.emit_insn(Insn::HaltIfNull {
                 target_reg: new_start + *col_idx,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
-                description: format!("{}.{}", table.get_name(), col.name.as_ref().unwrap()),
+                description: String::from(table.get_name()) + "." + col.name.as_ref().unwrap(),
             });
         }
         if col.is_rowid_alias() {
@@ -1016,16 +1015,17 @@ pub fn emit_upsert(
         }
     }
 
-    // Build NEW table payload (excluding VIRTUAL columns)
-    let rec = program.alloc_register();
+    // Build NEW table payload
+    let record_reg = program.alloc_register();
+    let registers_and_columns = table
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (new_start + i, c));
     emit_make_record_without_virtual_columns(
         program,
-        table
-            .columns()
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (new_start + i, c)),
-        rec,
+        registers_and_columns,
+        record_reg,
         table.btree().is_some_and(|bt| bt.is_strict),
     );
 
@@ -1082,7 +1082,7 @@ pub fn emit_upsert(
         program.emit_insn(Insn::Insert {
             cursor: ctx.cursor_id,
             key_reg: rnew,
-            record_reg: rec,
+            record_reg,
             flag: InsertFlags::new()
                 .require_seek()
                 .update_rowid_change()
@@ -1093,7 +1093,7 @@ pub fn emit_upsert(
         program.emit_insn(Insn::Insert {
             cursor: ctx.cursor_id,
             key_reg: ctx.conflict_rowid_reg,
-            record_reg: rec,
+            record_reg,
             flag: InsertFlags::new().skip_last_rowid(),
             table_name: table.get_name().to_string(),
         });
@@ -1152,7 +1152,7 @@ pub fn emit_upsert(
             // INSERT (after)
             let after_rec = if program.capture_data_changes_info().has_after() {
                 Some(emit_cdc_patch_record(
-                    program, table, new_start, rec, new_rowid,
+                    program, table, new_start, record_reg, new_rowid,
                 ))
             } else {
                 None
@@ -1174,7 +1174,7 @@ pub fn emit_upsert(
                     program,
                     table,
                     new_start,
-                    rec,
+                    record_reg,
                     ctx.conflict_rowid_reg,
                 ))
             } else {
@@ -1307,6 +1307,7 @@ pub fn collect_set_clauses_for_upsert(
             let Some(idx) = lookup.get(&normalize_ident(cn.as_str())) else {
                 bail_parse_error!("no such column: {}", cn);
             };
+            // cannot upsert generated column
             table.columns()[*idx].ensure_not_generated("UPDATE", cn.as_str())?;
             if let Some(existing) = out.iter_mut().find(|(i, _)| *i == *idx) {
                 existing.1 = e;
@@ -1385,10 +1386,6 @@ fn rewrite_expr_to_registers(
         if c.is_rowid_alias() {
             Some(rowid_reg)
         } else {
-            // Note: For VIRTUAL generated columns, the register at base_start + idx
-            // holds NULL (VIRTUAL columns are not stored). Index expressions on
-            // VIRTUAL columns should use ic.expr (the generating expression which
-            // references base columns), not the VIRTUAL column name directly.
             Some(base_start + idx)
         }
     };

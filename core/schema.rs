@@ -2153,7 +2153,7 @@ impl BTreeTable {
         let cmd = parser.next_cmd()?;
         match cmd {
             Some(Cmd::Stmt(Stmt::CreateTable { tbl_name, body, .. })) => {
-                create_table(tbl_name.name.as_str(), &body, root_page, None)
+                create_table(tbl_name.name.as_str(), &body, root_page)
             }
             _ => unreachable!("Expected CREATE TABLE statement"),
         }
@@ -2206,7 +2206,7 @@ impl BTreeTable {
                 sql.push_str(&default.to_string());
             }
 
-            if let GeneratedType::Virtual(generated) = &column.generated_type {
+            if let GeneratedType::Virtual(generated) = &column.generated_type() {
                 sql.push_str(" AS (");
                 sql.push_str(&generated.to_string());
                 sql.push(')');
@@ -2347,9 +2347,7 @@ impl BTreeTable {
     }
 
     /// Convert a logical column index to a physical column index.
-    /// Physical indices skip VIRTUAL generated columns since they are not stored in the record.
-    /// Note: Rowid alias (INTEGER PRIMARY KEY) columns ARE counted as physical columns
-    /// because they are stored in the record body (even though the rowid is also the B-tree key).
+    /// This accounts for virtual columns, since they're not stored in the record.
     #[inline]
     pub fn logical_to_physical_column(&self, logical: usize) -> usize {
         let mut physical = 0;
@@ -2458,8 +2456,10 @@ fn collect_column_refs(expr: &Expr) -> HashSet<String> {
 
 /// Extract all column name references from an expression as a set.
 /// `columns` is used to resolve pre-resolved `Expr::Column { SELF_TABLE }` back to names.
+//TODO all this usage of [normalize_ident] should be replaced with a proper [Identifier] domain type.
 pub fn collect_column_dependencies_of_expr(expr: &Expr, columns: &[Column]) -> HashSet<String> {
     let mut refs = HashSet::default();
+
     let _ = walk_expr(expr, &mut |e| match e {
         Expr::Id(name) | Expr::Name(name) => {
             refs.insert(normalize_ident(name.as_str()));
@@ -2483,11 +2483,16 @@ pub fn collect_column_dependencies_of_expr(expr: &Expr, columns: &[Column]) -> H
         | Expr::SubqueryResult { .. } => Ok(WalkControl::SkipChildren),
         _ => Ok(WalkControl::Continue),
     });
+
     refs
 }
 
+fn has_transitive_dependency(start: &str, target: &str, columns: &[Column]) -> bool {
+    let mut visited = std::collections::HashSet::new();
+    has_transitive_dependency_inner(start, target, columns, &mut visited)
+}
 
-fn has_transitive_dependency(
+fn has_transitive_dependency_inner(
     start: &str,
     target: &str,
     columns: &[Column],
@@ -2497,13 +2502,11 @@ fn has_transitive_dependency(
         return false;
     }
 
-    let col = columns.iter().find(|c| c.name.as_deref() == Some(start));
-
-    let Some(col) = col else {
+    let Some(col) = columns.iter().find(|c| c.name.as_deref() == Some(start)) else {
         return false;
     };
 
-    let GeneratedType::Virtual(ref gen_expr) = col.generated_type else {
+    let GeneratedType::Virtual(ref gen_expr) = col.generated_type() else {
         return false;
     };
 
@@ -2514,7 +2517,7 @@ fn has_transitive_dependency(
     }
 
     for dep in deps {
-        if has_transitive_dependency(&dep, target, columns, visited) {
+        if has_transitive_dependency_inner(&dep, target, columns, visited) {
             return true;
         }
     }
@@ -2536,9 +2539,7 @@ pub fn resolve_gencol_names(gencol_expr: &mut Expr, columns: &[Column]) -> Resul
                         .as_ref()
                         .is_some_and(|n| n.eq_ignore_ascii_case(&col_name))
                 })
-                .ok_or_else(|| {
-                    LimboError::ParseError(format!("no such column: {col_name}"))
-                })?;
+                .ok_or_else(|| LimboError::ParseError(format!("no such column: {col_name}")))?;
             *e = Expr::Column {
                 database: None,
                 table: TableInternalId::SELF_TABLE,
@@ -2552,16 +2553,10 @@ pub fn resolve_gencol_names(gencol_expr: &mut Expr, columns: &[Column]) -> Resul
     Ok(())
 }
 
-fn resolve_generated_expr_function(
-    resolver: Option<&Resolver>,
+fn resolve_gencol_expr_function(
     name: &Name,
     arg_count: usize,
 ) -> Result<Func> {
-    if let Some(resolver) = resolver {
-        if let Some(func) = resolver.resolve_function(name.as_str(), arg_count) {
-            return Ok(func);
-        }
-    }
     Func::resolve_function(name.as_str(), arg_count)
 }
 
@@ -2573,7 +2568,7 @@ fn is_aggregate_function(func: &Func) -> bool {
     }
 }
 
-fn validate_generated_expr(expr: &Expr, resolver: Option<&Resolver>) -> Result<()> {
+fn validate_generated_expr(expr: &Expr) -> Result<()> {
     use ast::Expr;
     match expr {
         Expr::Qualified(_, _) => {
@@ -2596,17 +2591,15 @@ fn validate_generated_expr(expr: &Expr, resolver: Option<&Resolver>) -> Result<(
             if filter_over.over_clause.is_some() {
                 bail_parse_error!("window functions prohibited in generated columns");
             }
-            let func = resolve_generated_expr_function(resolver, name, args.len())?;
+            let func = resolve_gencol_expr_function(name, args.len())?;
             if is_aggregate_function(&func) {
                 bail_parse_error!("aggregate functions prohibited in generated columns");
             }
             if !func.is_deterministic() {
-                bail_parse_error!(
-                    "non-deterministic functions prohibited in generated columns"
-                );
+                bail_parse_error!("non-deterministic functions prohibited in generated columns");
             }
             for arg in args {
-                validate_generated_expr(arg, resolver)?;
+                validate_generated_expr(arg)?;
             }
         }
 
@@ -2614,27 +2607,25 @@ fn validate_generated_expr(expr: &Expr, resolver: Option<&Resolver>) -> Result<(
             if filter_over.over_clause.is_some() {
                 bail_parse_error!("window functions prohibited in generated columns");
             }
-            let func = resolve_generated_expr_function(resolver, name, 0)?;
+            let func = resolve_gencol_expr_function(name, 0)?;
             if is_aggregate_function(&func) {
                 bail_parse_error!("aggregate functions prohibited in generated columns");
             }
             if !func.is_deterministic() {
-                bail_parse_error!(
-                    "non-deterministic functions prohibited in generated columns"
-                );
+                bail_parse_error!("non-deterministic functions prohibited in generated columns");
             }
         }
 
         Expr::Binary(lhs, _, rhs) => {
-            validate_generated_expr(lhs, resolver)?;
-            validate_generated_expr(rhs, resolver)?;
+            validate_generated_expr(lhs)?;
+            validate_generated_expr(rhs)?;
         }
         Expr::Unary(_, inner) => {
-            validate_generated_expr(inner, resolver)?;
-        },
+            validate_generated_expr(inner)?;
+        }
         Expr::Parenthesized(exprs) => {
             for e in exprs {
-                validate_generated_expr(e, resolver)?;
+                validate_generated_expr(e)?;
             }
         }
         Expr::Case {
@@ -2644,58 +2635,53 @@ fn validate_generated_expr(expr: &Expr, resolver: Option<&Resolver>) -> Result<(
             ..
         } => {
             if let Some(b) = base {
-                validate_generated_expr(b, resolver)?;
+                validate_generated_expr(b)?;
             }
             for (w, t) in when_then_pairs {
-                validate_generated_expr(w, resolver)?;
-                validate_generated_expr(t, resolver)?;
+                validate_generated_expr(w)?;
+                validate_generated_expr(t)?;
             }
             if let Some(e) = else_expr {
-                validate_generated_expr(e, resolver)?;
+                validate_generated_expr(e)?;
             }
         }
         Expr::Cast { expr, .. } => {
-            validate_generated_expr(expr, resolver)?;
-        },
+            validate_generated_expr(expr)?;
+        }
         Expr::InList { lhs, rhs, .. } => {
-            validate_generated_expr(lhs, resolver)?;
+            validate_generated_expr(lhs)?;
             for e in rhs {
-                validate_generated_expr(e, resolver)?;
+                validate_generated_expr(e)?;
             }
         }
         Expr::Between {
             lhs, start, end, ..
         } => {
-            validate_generated_expr(lhs, resolver)?;
-            validate_generated_expr(start, resolver)?;
-            validate_generated_expr(end, resolver)?;
+            validate_generated_expr(lhs)?;
+            validate_generated_expr(start)?;
+            validate_generated_expr(end)?;
         }
         Expr::Like {
             lhs, rhs, escape, ..
         } => {
-            validate_generated_expr(lhs, resolver)?;
-            validate_generated_expr(rhs, resolver)?;
+            validate_generated_expr(lhs)?;
+            validate_generated_expr(rhs)?;
             if let Some(e) = escape {
-                validate_generated_expr(e, resolver)?;
+                validate_generated_expr(e)?;
             }
         }
         Expr::Collate(inner, _) => {
-            validate_generated_expr(inner, resolver)?;
-        },
+            validate_generated_expr(inner)?;
+        }
         Expr::IsNull(inner) | Expr::NotNull(inner) => {
-            validate_generated_expr(inner, resolver)?;
+            validate_generated_expr(inner)?;
         }
         _ => {}
     }
     Ok(())
 }
 
-pub fn create_table( //TODO I don't like this Option argument...
-    tbl_name: &str,
-    body: &CreateTableBody,
-    root_page: i64,
-    resolver: Option<&Resolver>,
-) -> Result<BTreeTable> {
+pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> Result<BTreeTable> {
     let table_name = normalize_ident(tbl_name);
     trace!("Creating table {}", table_name);
     let mut has_rowid = true;
@@ -2902,7 +2888,7 @@ pub fn create_table( //TODO I don't like this Option argument...
                 };
 
                 let mut default = None;
-                let mut generated: Option<Box<ast::Expr>> = None;
+                let mut generated: Option<Box<Expr>> = None;
                 let mut primary_key = false;
                 let mut notnull = false;
                 let mut notnull_conflict_clause = None;
@@ -2923,11 +2909,11 @@ pub fn create_table( //TODO I don't like this Option argument...
                                 .as_ref()
                                 .is_some_and(|t| t.as_str().eq_ignore_ascii_case("STORED"))
                             {
-                                crate::bail_parse_error!(
+                                bail_parse_error!(
                                     "STORED generated columns are not supported"
                                 );
                             }
-                            validate_generated_expr(expr, resolver)?;
+                            validate_generated_expr(expr)?;
                             generated = Some(expr.clone());
                         }
                         ast::ColumnConstraint::PrimaryKey {
@@ -3037,57 +3023,37 @@ pub fn create_table( //TODO I don't like this Option argument...
                     }
                 }
 
-                // Validate generated column constraints
                 if let Some(ref gen_expr) = generated {
                     if primary_key {
-                        crate::bail_parse_error!(
+                        bail_parse_error!(
                             "generated column \"{}\" cannot be part of the PRIMARY KEY",
                             name
                         );
                     }
                     if default.is_some() {
-                        crate::bail_parse_error!(
+                        bail_parse_error!(
                             "generated column \"{}\" cannot have a DEFAULT value",
                             name
                         );
                     }
 
-                    // Extract column references from the generated expression
                     let referenced_cols = collect_column_refs(gen_expr);
-
-                    for ref_col in &referenced_cols {
-                        if !columns
-                            .iter()
-                            .any(|c| normalize_ident(c.col_name.as_str()) == *ref_col)
-                        {
-                            crate::bail_parse_error!("no such column: {}", ref_col);
-                        }
-                    }
-
-                    // Normalize the current column name for comparison
                     let current_col_name = normalize_ident(&name);
 
-                    // Check for self-reference
                     if referenced_cols.iter().any(|c| c == &current_col_name) {
-                        crate::bail_parse_error!(
+                        bail_parse_error!(
                             "generated column \"{}\" cannot reference itself",
                             name
                         );
                     }
 
-                    // Check for circular references (including transitive cycles)
-                    // For each referenced column that is also a generated column,
-                    // check if it can transitively reach back to the current column
                     for ref_col in &referenced_cols {
-                        //TODO this is ugly, hide the set creation
-                        let mut visited = std::collections::HashSet::new();
                         if has_transitive_dependency(
                             ref_col,
                             &current_col_name,
                             &cols,
-                            &mut visited,
                         ) {
-                            crate::bail_parse_error!(
+                            bail_parse_error!(
                                 "circular dependency in generated columns \"{}\" and \"{}\"",
                                 name,
                                 ref_col
@@ -3211,8 +3177,7 @@ pub fn create_table( //TODO I don't like this Option argument...
     // Pre-resolve generated column names to Expr::Column { table: SELF_TABLE, ... }
     for i in 0..cols.len() {
         if cols[i].is_virtual_generated() {
-            // Safety: we split the borrow — take the expr out, resolve against all cols, put it back.
-            let mut expr = cols[i].generated_expr_cloned().unwrap();
+            let mut expr = cols[i].generated_expr().cloned().unwrap();
             resolve_gencol_names(&mut expr, &cols)?;
             *cols[i].generated_expr_mut().unwrap() = expr;
         }
@@ -3671,11 +3636,6 @@ impl Column {
             GeneratedType::Virtual(expr) => Some(expr.as_mut()),
             GeneratedType::NotGenerated => None,
         }
-    }
-
-    #[inline]
-    pub fn generated_expr_cloned(&self) -> Option<Expr> {
-        self.generated_expr().cloned()
     }
 
     #[inline]

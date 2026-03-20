@@ -21,7 +21,7 @@ use crate::types::{
     ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
 };
 use crate::util::{
-    escape_sql_string_literal, normalize_ident, rename_column_refs_in_expr, rename_identifiers,
+    escape_sql_string_literal, normalize_ident, rename_identifiers,
     rename_identifiers_scoped_when_clause, rewrite_check_expr_table_refs,
     rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
     rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
@@ -11744,15 +11744,6 @@ pub fn op_add_column(
 
         let btree = Arc::make_mut(btree);
         btree.columns.push((**column).clone());
-        // Pre-resolve generated column names for the newly added column
-        if btree.columns.last().unwrap().is_virtual_generated() {
-            let last_idx = btree.columns.len() - 1;
-            if let Some(mut expr) = btree.columns[last_idx].generated_expr_cloned() {
-                if let Ok(()) = crate::schema::resolve_gencol_names(&mut expr, &btree.columns) {
-                    *btree.columns[last_idx].generated_expr_mut().unwrap() = expr;
-                }
-            }
-        }
         // Update CHECK constraints to include any constraints from the new column
         btree.check_constraints.clone_from(check_constraints);
     });
@@ -11850,10 +11841,6 @@ pub fn op_alter_column(
                     ) {
                         ic.name.clone_from(&new_name);
                     }
-                    // Also update references in the expression (for VIRTUAL column indexes)
-                    if let Some(ref mut expr) = ic.expr {
-                        rename_column_refs_in_expr(expr, &old_column_name, &new_name);
-                    }
                 }
                 // Update partial index WHERE clause column references
                 if let Some(ref mut wc) = idx.where_clause {
@@ -11916,13 +11903,6 @@ pub fn op_alter_column(
                         pc.clone_from(&new_name);
                     }
                 }
-            }
-        }
-
-        // Update generated column expressions that reference the renamed column.
-        for other_col in &mut btree.columns {
-            if let Some(gen_expr) = other_col.generated_expr_mut() {
-                rename_column_refs_in_expr(gen_expr, &old_column_name, &new_name);
             }
         }
 

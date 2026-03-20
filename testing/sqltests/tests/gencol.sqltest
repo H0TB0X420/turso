@@ -232,6 +232,13 @@ test gencol_error_self_reference {
 expect error {
 }
 
+# Self-reference with mixed case: column "B" references "b" (same after normalization)
+test gencol_error_self_reference_case_insensitive {
+    CREATE TABLE t1(a INTEGER, B AS (b+1));
+}
+expect error {
+}
+
 # -----------------------------------------------------------------------------
 # Error cases: Circular dependency not allowed
 # -----------------------------------------------------------------------------
