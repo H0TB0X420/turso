@@ -2895,7 +2895,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 .as_ref()
                                 .is_some_and(|t| t.as_str().eq_ignore_ascii_case("STORED"))
                             {
-                                bail_parse_error!("STORED generated columns are not supported");
+                                bail_parse_error!("Stored generated columns are not supported");
                             }
                             validate_generated_expr(expr)?;
                             generated = Some(expr.clone());

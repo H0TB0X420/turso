@@ -7995,7 +7995,7 @@ pub fn op_function(
                                             &normalized_tbl_name,
                                             &rename_from,
                                             column_def.col_name.as_str(),
-                                        );
+                                        )?;
                                     }
                                 } else {
                                     // This is a different table, check if it has FKs referencing the renamed column
@@ -8037,7 +8037,7 @@ pub fn op_function(
                                             &table,
                                             &rename_from,
                                             column_def.col_name.as_str(),
-                                        );
+                                        )?;
                                         if local_col != *col {
                                             *col = local_col;
                                             fk_updated = true;

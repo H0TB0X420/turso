@@ -7,7 +7,7 @@ use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::{JoinedTable, TableReferences};
 use crate::translate::planner::{parse_row_id, TableMask};
 use crate::types::IOResult;
-use crate::{IO};
+use crate::{bail_parse_error, IO};
 use crate::{
     schema::{Column, Schema, Table, Type},
     types::{Value, ValueType},
@@ -3197,7 +3197,7 @@ pub fn rewrite_column_references_if_needed(
     table: &str,
     from: &str,
     to: &str,
-) {
+) -> Result<()>{
     for cc in &mut col.constraints {
         match &mut cc.constraint {
             ast::ColumnConstraint::ForeignKey { clause, .. } => {
@@ -3207,12 +3207,12 @@ pub fn rewrite_column_references_if_needed(
                 rename_identifiers(expr, from, to);
             }
             ast::ColumnConstraint::Generated { .. } => {
-                // bail_parse_error!("altering generated columns is not supported yet");
-                //TODO block this path
+                bail_parse_error!("renaming generated columns is not supported yet");
             }
             _ => {}
         }
     }
+    Ok(())
 }
 
 /// If a FK REFERENCES targets `old_tbl`, change it to `new_tbl`

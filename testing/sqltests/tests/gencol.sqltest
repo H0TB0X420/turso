@@ -1399,8 +1399,8 @@ test gencol_rename_column_updates_expression {
     ALTER TABLE t1 RENAME COLUMN a TO c;
     SELECT sql FROM sqlite_master WHERE name='t1';
 }
-expect {
-    CREATE TABLE t1 (c TEXT, b TEXT AS (c))
+expect error {
+    renaming generated columns is not supported yet
 }
 
 # Dependency chain: base column renamed updates all dependents
@@ -1410,8 +1410,8 @@ test gencol_rename_column_chain {
     INSERT INTO t1(x) VALUES(5);
     SELECT x, b, c FROM t1;
 }
-expect {
-    5|10|15
+expect error {
+    Parse error: renaming generated columns is not supported yet
 }
 
 # Rename middle column in chain updates dependents
@@ -1421,8 +1421,8 @@ test gencol_rename_column_middle {
     INSERT INTO t1(a) VALUES(5);
     SELECT a, y, c FROM t1;
 }
-expect {
-    5|10|11
+expect error {
+    Parse error: renaming generated columns is not supported yet
 }
 
 # Complex expression with function calls
@@ -1432,8 +1432,8 @@ test gencol_rename_column_complex_expr {
     INSERT INTO t1(name) VALUES('hello');
     SELECT name, b FROM t1;
 }
-expect {
-    hello|HELLO_suffix
+expect error {
+    renaming generated columns is not supported yet
 }
 
 # Multiple generated columns referencing same column
@@ -1443,8 +1443,8 @@ test gencol_rename_column_multiple_refs {
     INSERT INTO t1(val) VALUES(10);
     SELECT val, b, c, d FROM t1;
 }
-expect {
-    10|11|20|9
+expect error {
+    renaming generated columns is not supported yet
 }
 
 # Case-insensitive column reference matching
@@ -1454,8 +1454,8 @@ test gencol_rename_column_case_insensitive {
     INSERT INTO t1(newcol) VALUES(5);
     SELECT newcol, b FROM t1;
 }
-expect {
-    5|10
+expect error {
+    renaming generated columns is not supported yet
 }
 
 # -----------------------------------------------------------------------------
@@ -1909,12 +1909,8 @@ test gencol_rename_column_with_index_on_generated {
     UPDATE t1 SET b = 2.0, d = 'updated' WHERE b = 1.0;
     SELECT d, b, c FROM t1;
 }
-expect {
-    updated|2.0|updatedupdated
-}
-# JS Number omits .0 for whole numbers
-expect @js {
-    updated|2|updatedupdated
+expect error {
+    Parse error: renaming generated columns is not supported yet
 }
 
 test virtual-column-chain-update {
@@ -2073,6 +2069,9 @@ test gencol_intreal_typeof {
 }
 expect {
     real|20.0
+}
+expect @js {
+    real|20
 }
 
 # -----------------------------------------------------------------------------
@@ -2284,21 +2283,22 @@ expect @js {
     10|10|10|121
 }
 
-# Test that STORED generated columns are rejected with an error.
-@skip-if sqlite "SQLite supports STORED generated columns; turso does not"
+# Test that stored generated columns are rejected with an error.
+@skip-if sqlite "TODO support stored generated columns"
 test gencol_stored_rejected {
     CREATE TABLE t1(a INTEGER, b INTEGER AS (a * 2) STORED);
 }
 expect error {
+    asdf
 }
 
-# STORED generated columns with explicit GENERATED ALWAYS syntax should also be rejected
-@skip-if sqlite "SQLite supports STORED generated columns; turso does not"
+# Stored generated columns with explicit GENERATED ALWAYS syntax should also be rejected
+@skip-if sqlite "TODO support stored generated columns"
 test gencol_stored_generated_always_rejected {
     CREATE TABLE t1(a REAL, b INTEGER GENERATED ALWAYS AS (a) STORED);
 }
 expect error {
-    STORED generated columns are not supported
+    Stored generated columns are not supported
 }
 
 # Generated columns use their own collation (BINARY), not the source column's
@@ -2469,6 +2469,9 @@ test gencol_validate_nested_cast {
 }
 expect {
     8.0
+}
+expect @js {
+    8
 }
 
 # IS NULL nested inside a binary expression
