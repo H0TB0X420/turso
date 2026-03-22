@@ -416,10 +416,18 @@ pub fn emit_upsert(
                 dest: current_start + i,
                 dest_end: None,
             });
+        } else if col.is_rowid_alias() {
+            program.emit_insn(Insn::RowId {
+                cursor_id: ctx.cursor_id,
+                dest: current_start + i,
+            });
         } else {
-            // emit_column_or_rowid handles: rowid alias → RowId instruction,
-            // regular columns → Column with logical-to-physical index conversion.
-            program.emit_column_or_rowid(ctx.cursor_id, i, current_start + i);
+            program.emit_insn(Insn::Column {
+                cursor_id: ctx.cursor_id,
+                column: i,
+                dest: current_start + i,
+                default: None,
+            });
         }
     }
 
